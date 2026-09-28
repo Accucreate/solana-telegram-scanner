@@ -26,7 +26,13 @@ RUGCHECK_REPORT = (
     "https://api.rugcheck.xyz/v1/tokens/{}/report"
 )
 
-TELEGRAM_API = "https://api.telegram.org/bot{}/sendMessage"
+SOLANA_RPC = (
+    "https://api.mainnet-beta.solana.com"
+)
+
+TELEGRAM_API = (
+    "https://api.telegram.org/bot{}/sendMessage"
+)
 
 SEEN_FILE = "seen_tokens.json"
 
@@ -35,37 +41,53 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
-# BASIC HELPERS
+# SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "SolanaTelegramScanner/1.0"
+    "User-Agent": "SolanaTelegramScanner/2.0"
 })
 
 
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
 def log(message):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
+
+    now = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    print(
+        f"[{now}] {message}",
+        flush=True
+    )
 
 
 def safe_float(value, default=0):
+
     try:
+
         if value is None:
             return default
 
         if isinstance(value, str):
+
             value = value.replace(",", "")
             value = value.replace("$", "")
 
         return float(value)
 
     except Exception:
+
         return default
 
 
 def format_money(value):
+
     value = safe_float(value)
 
     if value >= 1_000_000:
@@ -78,8 +100,10 @@ def format_money(value):
 
 
 def format_number(value):
+
     try:
         return f"{int(value):,}"
+
     except Exception:
         return "Unknown"
 
@@ -91,10 +115,16 @@ def format_number(value):
 def load_seen():
 
     try:
+
         if not os.path.exists(SEEN_FILE):
             return set()
 
-        with open(SEEN_FILE, "r", encoding="utf-8") as file:
+        with open(
+            SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
             data = json.load(file)
 
         if isinstance(data, list):
@@ -103,18 +133,35 @@ def load_seen():
         return set()
 
     except Exception as e:
-        log(f"Could not load seen tokens: {e}")
+
+        log(
+            f"Could not load seen tokens: {e}"
+        )
+
         return set()
 
 
 def save_seen(seen):
 
     try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as file:
-            json.dump(sorted(list(seen)), file, indent=2)
+
+        with open(
+            SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                sorted(list(seen)),
+                file,
+                indent=2
+            )
 
     except Exception as e:
-        log(f"Could not save seen tokens: {e}")
+
+        log(
+            f"Could not save seen tokens: {e}"
+        )
 
 
 # ============================================================
@@ -151,11 +198,16 @@ def get_latest_solana_tokens():
                 if address:
                     addresses.append(address)
 
-        return list(dict.fromkeys(addresses))
+        return list(
+            dict.fromkeys(addresses)
+        )
 
     except Exception as e:
 
-        log(f"DexScreener discovery error: {e}")
+        log(
+            f"DexScreener discovery error: {e}"
+        )
+
         return []
 
 
@@ -183,7 +235,6 @@ def get_token_pair(mint):
         if not solana_pairs:
             return None
 
-        # Select the pair with the highest liquidity.
         solana_pairs.sort(
             key=lambda p: safe_float(
                 (p.get("liquidity") or {}).get("usd")
@@ -195,8 +246,89 @@ def get_token_pair(mint):
 
     except Exception as e:
 
-        log(f"Pair lookup error for {mint}: {e}")
+        log(
+            f"Pair lookup error for {mint}: {e}"
+        )
+
         return None
+
+
+# ============================================================
+# SOLANA ON-CHAIN AUTHORITY CHECK
+# ============================================================
+
+def get_token_authorities(mint):
+
+    result = {
+        "mint_authority": None,
+        "freeze_authority": None,
+        "success": False
+    }
+
+    try:
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                mint,
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": "confirmed"
+                }
+            ]
+        }
+
+        response = session.post(
+            SOLANA_RPC,
+            json=payload,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        value = (
+            data
+            .get("result", {})
+            .get("value")
+        )
+
+        if not value:
+            return result
+
+        account_data = value.get("data") or {}
+
+        parsed = account_data.get("parsed") or {}
+
+        info = parsed.get("info") or {}
+
+        # Make sure this is a mint account.
+        if parsed.get("type") != "mint":
+            return result
+
+        result["mint_authority"] = (
+            info.get("mintAuthority")
+        )
+
+        result["freeze_authority"] = (
+            info.get("freezeAuthority")
+        )
+
+        result["success"] = True
+
+        return result
+
+    except Exception as e:
+
+        log(
+            f"On-chain authority error "
+            f"for {mint}: {e}"
+        )
+
+        return result
 
 
 # ============================================================
@@ -208,8 +340,6 @@ def get_rugcheck_data(mint):
     result = {
         "holders": None,
         "top10": None,
-        "mint_authority": None,
-        "freeze_authority": None,
         "risk": None
     }
 
@@ -228,7 +358,7 @@ def get_rugcheck_data(mint):
         data = response.json()
 
         # -----------------------------
-        # Holder count
+        # HOLDERS
         # -----------------------------
 
         holder_count = (
@@ -241,66 +371,45 @@ def get_rugcheck_data(mint):
             result["holders"] = holder_count
 
         # -----------------------------
-        # Mint authority
+        # TOP 10
         # -----------------------------
 
-        mint_authority = (
-            data.get("mintAuthority")
+        top_holders = data.get(
+            "topHolders"
         )
 
-        if mint_authority is None:
-
-            token = data.get("token") or {}
-
-            mint_authority = token.get(
-                "mintAuthority"
-            )
-
-        result["mint_authority"] = mint_authority
-
-        # -----------------------------
-        # Freeze authority
-        # -----------------------------
-
-        freeze_authority = (
-            data.get("freezeAuthority")
-        )
-
-        if freeze_authority is None:
-
-            token = data.get("token") or {}
-
-            freeze_authority = token.get(
-                "freezeAuthority"
-            )
-
-        result["freeze_authority"] = freeze_authority
-
-        # -----------------------------
-        # Top 10 holder concentration
-        # -----------------------------
-
-        top_holders = data.get("topHolders")
-
-        if isinstance(top_holders, list) and top_holders:
+        if (
+            isinstance(top_holders, list)
+            and top_holders
+        ):
 
             total_percentage = 0
 
             for holder in top_holders[:10]:
 
+                if not isinstance(
+                    holder,
+                    dict
+                ):
+                    continue
+
                 percentage = safe_float(
                     holder.get("pct")
                     or holder.get("percentage")
-                    or holder.get("ownershipPercentage")
+                    or holder.get(
+                        "ownershipPercentage"
+                    )
                 )
 
                 total_percentage += percentage
 
             if total_percentage > 0:
-                result["top10"] = total_percentage
+                result["top10"] = (
+                    total_percentage
+                )
 
         # -----------------------------
-        # Risk
+        # RISKS
         # -----------------------------
 
         risks = data.get("risks")
@@ -311,18 +420,25 @@ def get_rugcheck_data(mint):
 
             for risk in risks:
 
-                if isinstance(risk, dict):
+                if not isinstance(
+                    risk,
+                    dict
+                ):
+                    continue
 
-                    name = (
-                        risk.get("name")
-                        or risk.get("description")
-                        or risk.get("level")
+                name = (
+                    risk.get("name")
+                    or risk.get("description")
+                    or risk.get("level")
+                )
+
+                if name:
+                    risk_names.append(
+                        str(name)
                     )
 
-                    if name:
-                        risk_names.append(str(name))
-
             if risk_names:
+
                 result["risk"] = ", ".join(
                     risk_names[:5]
                 )
@@ -331,7 +447,10 @@ def get_rugcheck_data(mint):
 
     except Exception as e:
 
-        log(f"RugCheck error for {mint}: {e}")
+        log(
+            f"RugCheck error for {mint}: {e}"
+        )
+
         return result
 
 
@@ -341,13 +460,11 @@ def get_rugcheck_data(mint):
 
 def authority_status(authority):
 
+    # None means the authority is revoked.
     if authority is None:
-        return "Unknown"
-
-    if authority == "":
         return "Revoked"
 
-    if authority is False:
+    if authority == "":
         return "Revoked"
 
     return "Active"
@@ -361,12 +478,16 @@ def get_token_age(pair):
 
     try:
 
-        created = pair.get("pairCreatedAt")
+        created = pair.get(
+            "pairCreatedAt"
+        )
 
         if not created:
             return "Unknown"
 
-        created_seconds = created / 1000
+        created_seconds = (
+            created / 1000
+        )
 
         now = datetime.now(
             timezone.utc
@@ -377,21 +498,28 @@ def get_token_age(pair):
             now - created_seconds
         )
 
-        minutes = int(age_seconds / 60)
+        minutes = int(
+            age_seconds / 60
+        )
 
         if minutes < 60:
             return f"{minutes} min"
 
-        hours = int(minutes / 60)
+        hours = int(
+            minutes / 60
+        )
 
         if hours < 24:
             return f"{hours} hr"
 
-        days = int(hours / 24)
+        days = int(
+            hours / 24
+        )
 
         return f"{days} day"
 
     except Exception:
+
         return "Unknown"
 
 
@@ -402,11 +530,21 @@ def get_token_age(pair):
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-        log("ERROR: TELEGRAM_BOT_TOKEN is missing")
+
+        log(
+            "ERROR: TELEGRAM_BOT_TOKEN "
+            "is missing"
+        )
+
         return False
 
     if not TELEGRAM_CHAT_ID:
-        log("ERROR: TELEGRAM_CHAT_ID is missing")
+
+        log(
+            "ERROR: TELEGRAM_CHAT_ID "
+            "is missing"
+        )
+
         return False
 
     url = TELEGRAM_API.format(
@@ -440,7 +578,10 @@ def send_telegram(message):
 
     except Exception as e:
 
-        log(f"Telegram connection error: {e}")
+        log(
+            f"Telegram connection error: {e}"
+        )
+
         return False
 
 
@@ -451,10 +592,13 @@ def send_telegram(message):
 def build_alert(
     pair,
     mint,
-    security
+    security,
+    authorities
 ):
 
-    base_token = pair.get("baseToken") or {}
+    base_token = (
+        pair.get("baseToken") or {}
+    )
 
     name = (
         base_token.get("name")
@@ -472,45 +616,96 @@ def build_alert(
     )
 
     liquidity = safe_float(
-        (pair.get("liquidity") or {}).get("usd")
+        (pair.get("liquidity") or {})
+        .get("usd")
     )
 
     volume = safe_float(
-        (pair.get("volume") or {}).get("h24")
+        (pair.get("volume") or {})
+        .get("h24")
     )
 
-    holders = security.get("holders")
+    # -----------------------------
+    # HOLDERS
+    # -----------------------------
+
+    holders = security.get(
+        "holders"
+    )
 
     if holders is None:
         holders_text = "Unknown"
-    else:
-        holders_text = format_number(holders)
 
-    top10 = security.get("top10")
+    else:
+        holders_text = format_number(
+            holders
+        )
+
+    # -----------------------------
+    # TOP 10
+    # -----------------------------
+
+    top10 = security.get(
+        "top10"
+    )
 
     if top10 is None:
         top10_text = "Unknown"
+
     else:
-        top10_text = f"{top10:.1f}%"
+        top10_text = (
+            f"{top10:.1f}%"
+        )
 
-    mint_status = authority_status(
-        security.get("mint_authority")
-    )
+    # -----------------------------
+    # AUTHORITIES
+    # -----------------------------
 
-    freeze_status = authority_status(
-        security.get("freeze_authority")
-    )
+    if authorities.get("success"):
+
+        mint_status = authority_status(
+            authorities.get(
+                "mint_authority"
+            )
+        )
+
+        freeze_status = authority_status(
+            authorities.get(
+                "freeze_authority"
+            )
+        )
+
+    else:
+
+        mint_status = "Unknown"
+        freeze_status = "Unknown"
+
+    # -----------------------------
+    # AGE
+    # -----------------------------
 
     age = get_token_age(pair)
 
+    # -----------------------------
+    # LINKS
+    # -----------------------------
+
     dex_url = (
         pair.get("url")
-        or f"https://dexscreener.com/solana/{mint}"
+        or (
+            "https://dexscreener.com/"
+            f"solana/{mint}"
+        )
     )
 
     rug_url = (
-        f"https://rugcheck.xyz/tokens/{mint}"
+        f"https://rugcheck.xyz/tokens/"
+        f"{mint}"
     )
+
+    # -----------------------------
+    # MESSAGE
+    # -----------------------------
 
     message = f"""🚨 NEW SOLANA TOKEN
 
@@ -550,21 +745,31 @@ def scan():
     seen = load_seen()
 
     log("=" * 60)
-    log("🚀 SOLANA SCANNER STARTED")
+
     log(
-        f"Filters: MC ${MIN_MC:,} - "
-        f"${MAX_MC:,} | "
-        f"Liquidity >= ${MIN_LIQUIDITY:,}"
+        "🚀 SOLANA SCANNER STARTED"
     )
+
+    log(
+        f"Filters: MC "
+        f"${MIN_MC:,} - "
+        f"${MAX_MC:,} | "
+        f"Liquidity >= "
+        f"${MIN_LIQUIDITY:,}"
+    )
+
     log(
         f"Previously alerted tokens: "
         f"{len(seen)}"
     )
 
-    addresses = get_latest_solana_tokens()
+    addresses = (
+        get_latest_solana_tokens()
+    )
 
     log(
-        f"Discovered {len(addresses)} "
+        f"Discovered "
+        f"{len(addresses)} "
         f"Solana token addresses"
     )
 
@@ -589,7 +794,8 @@ def scan():
         )
 
         liquidity = safe_float(
-            (pair.get("liquidity") or {}).get("usd")
+            (pair.get("liquidity") or {})
+            .get("usd")
         )
 
         # -----------------------------
@@ -612,24 +818,42 @@ def scan():
         log(
             f"QUALIFIED: {mint} | "
             f"MC={format_money(mc)} | "
-            f"Liquidity={format_money(liquidity)}"
+            f"Liquidity="
+            f"{format_money(liquidity)}"
         )
 
-        security = get_rugcheck_data(mint)
+        # -----------------------------
+        # SECURITY DATA
+        # -----------------------------
+
+        security = get_rugcheck_data(
+            mint
+        )
+
+        # -----------------------------
+        # DIRECT BLOCKCHAIN CHECK
+        # -----------------------------
+
+        authorities = (
+            get_token_authorities(mint)
+        )
 
         message = build_alert(
             pair,
             mint,
-            security
+            security,
+            authorities
         )
 
         if send_telegram(message):
 
             log(
-                f"Telegram alert sent: {mint}"
+                f"Telegram alert sent: "
+                f"{mint}"
             )
 
             seen.add(mint)
+
             alerts += 1
 
             save_seen(seen)
@@ -637,18 +861,21 @@ def scan():
         else:
 
             log(
-                f"Telegram failed: {mint}"
+                f"Telegram failed: "
+                f"{mint}"
             )
 
     save_seen(seen)
 
     log("=" * 60)
+
     log(
         f"SCAN COMPLETE | "
         f"Checked: {checked} | "
         f"New alerts: {alerts} | "
         f"Seen: {len(seen)}"
     )
+
     log("=" * 60)
 
 
@@ -659,19 +886,31 @@ def scan():
 def main():
 
     if not TELEGRAM_BOT_TOKEN:
+
         log(
-            "❌ TELEGRAM_BOT_TOKEN is not set."
+            "❌ TELEGRAM_BOT_TOKEN "
+            "is not set."
         )
+
         return
 
     if not TELEGRAM_CHAT_ID:
+
         log(
-            "❌ TELEGRAM_CHAT_ID is not set."
+            "❌ TELEGRAM_CHAT_ID "
+            "is not set."
         )
+
         return
 
-    log("Telegram credentials detected.")
-    log("Automatic scanner is ready.")
+    log(
+        "Telegram credentials detected."
+    )
+
+    log(
+        "Automatic scanner is ready."
+    )
+
     log(
         f"Scanner will run every "
         f"{SCAN_INTERVAL // 60} minutes."
@@ -680,12 +919,14 @@ def main():
     while True:
 
         try:
+
             scan()
 
         except Exception as e:
 
             log(
-                f"Unexpected scanner error: {e}"
+                f"Unexpected scanner "
+                f"error: {e}"
             )
 
         log(
@@ -693,7 +934,9 @@ def main():
             f"{SCAN_INTERVAL} seconds..."
         )
 
-        time.sleep(SCAN_INTERVAL)
+        time.sleep(
+            SCAN_INTERVAL
+        )
 
 
 if __name__ == "__main__":
