@@ -1,144 +1,109 @@
 import os
-import time
 import json
+import time
 import threading
 import queue
+from datetime import datetime, timezone
+
 import requests
 import websocket
 
-from datetime import datetime, timezone
-
 
 # ============================================================
-# SETTINGS
+# CONFIGURATION
 # ============================================================
 
 MIN_MC = 5_000
 MAX_MC = 100_000
-
 MIN_LIQUIDITY = 5_000
 MIN_HOLDERS = 100
 
-# Maximum time we monitor a new Pump.fun token
+# Stop watching a token after this many minutes
 MONITOR_MAX_MINUTES = 30
 
-# How often the pending monitor runs
-MONITOR_INTERVAL = 5
+# Maximum number of tokens waiting to be processed
+MAX_PENDING_TOKENS = 500
 
-# Maximum tokens waiting in memory
-MAX_PENDING_TOKENS = 300
+# Queue is intentionally small.
+# We do NOT want hundreds of duplicate jobs.
+MAX_QUEUE_SIZE = 30
 
-# Number of workers
+# Number of worker threads.
+# Keep this low because external APIs have rate limits.
 WORKER_COUNT = 2
 
-# Minimum time between DexScreener requests
-# This is deliberately conservative to avoid 429 errors.
-DEX_REQUEST_GAP = 1.5
+# Minimum time between DexScreener requests.
+# This protects against 429 errors.
+DEX_MIN_REQUEST_INTERVAL = 1.5
 
-# Normal request timeout
+# Timeouts
 REQUEST_TIMEOUT = 20
+WS_TIMEOUT = 30
 
-# Retry settings
-MAX_RETRIES = 4
+# Retry settings for normal errors
+MAX_RETRIES = 2
+RETRY_DELAY = 2
 
-# PumpPortal
+# PumpPortal WebSocket
 PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
 
-
-# ============================================================
-# API URLS
-# ============================================================
-
+# Solana RPC
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
-DEXSCREENER_TOKEN = (
-    "https://api.dexscreener.com/latest/dex/tokens/"
-)
+# DexScreener
+DEXSCREENER_TOKEN = "https://api.dexscreener.com/latest/dex/tokens/"
 
-RUGCHECK_REPORT = (
-    "https://api.rugcheck.xyz/v1/tokens/{}/report"
-)
+# RugCheck
+RUGCHECK_REPORT = "https://api.rugcheck.xyz/v1/tokens/{}/report"
 
-TELEGRAM_API = (
-    "https://api.telegram.org/bot{}/sendMessage"
-)
+# Telegram
+TELEGRAM_API = "https://api.telegram.org/bot{}/sendMessage"
 
-
-# ============================================================
-# FILES
-# ============================================================
-
+# Seen tokens file
 SEEN_FILE = "seen_tokens.json"
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SETTINGS
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN"
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
-# RISK SETTINGS
-# ============================================================
-
-TOP10_GREEN = 30
-TOP10_YELLOW = 45
-
-LIQ_MC_GREEN = 30
-LIQ_MC_YELLOW = 15
-
-VOL_MC_GREEN_MAX = 5
-VOL_MC_YELLOW_MAX = 10
-
-HOLDERS_GREEN = 500
-HOLDERS_YELLOW = 100
-
-AGE_GREEN = 60
-AGE_YELLOW = 15
-
-
-# ============================================================
-# HTTP SESSION
+# GLOBAL OBJECTS
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "SolanaPumpScanner/7.0",
-    "Accept": "application/json"
+    "User-Agent": "Mozilla/5.0 Solana-Token-Scanner/2.0"
 })
 
+work_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-seen_lock = threading.Lock()
 pending_lock = threading.Lock()
+seen_lock = threading.Lock()
 
-seen = set()
+pending_tokens = {}
+seen_tokens = set()
 
-pending = {}
-
-token_queue = queue.Queue(
-    maxsize=MAX_PENDING_TOKENS
-)
-
-# Prevents duplicate queue entries
-queued_tokens = set()
-
-queued_lock = threading.Lock()
-
-# Last time we queried DexScreener
+# Protects DexScreener from excessive requests
 dex_lock = threading.Lock()
 last_dex_request = 0.0
+
+# Statistics
+stats_lock = threading.Lock()
+
+stats = {
+    "detected": 0,
+    "checked": 0,
+    "alerts": 0,
+    "expired": 0,
+    "dex_429": 0,
+    "queue_full": 0,
+}
 
 
 # ============================================================
@@ -146,256 +111,8 @@ last_dex_request = 0.0
 # ============================================================
 
 def log(message):
-
-    now = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    print(
-        f"[{now}] {message}",
-        flush=True
-    )
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def safe_float(value, default=0):
-
-    try:
-
-        if value is None:
-            return default
-
-        if isinstance(value, str):
-
-            value = value.replace(",", "")
-            value = value.replace("$", "")
-
-        return float(value)
-
-    except Exception:
-
-        return default
-
-
-def format_money(value):
-
-    value = safe_float(value)
-
-    if value >= 1_000_000:
-
-        return f"${value / 1_000_000:.2f}M"
-
-    if value >= 1_000:
-
-        return f"${value:,.0f}"
-
-    return f"${value:.2f}"
-
-
-def format_number(value):
-
-    try:
-
-        return f"{int(float(value)):,}"
-
-    except Exception:
-
-        return "Unknown"
-
-
-# ============================================================
-# RATE LIMITER
-# ============================================================
-
-def wait_for_dex_slot():
-
-    global last_dex_request
-
-    with dex_lock:
-
-        now = time.time()
-
-        wait_time = (
-            DEX_REQUEST_GAP
-            - (now - last_dex_request)
-        )
-
-        if wait_time > 0:
-
-            time.sleep(wait_time)
-
-        last_dex_request = time.time()
-
-
-# ============================================================
-# HTTP GET
-# ============================================================
-
-def request_get(
-    url,
-    service="generic",
-    **kwargs
-):
-
-    timeout = kwargs.pop(
-        "timeout",
-        REQUEST_TIMEOUT
-    )
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-        try:
-
-            # DexScreener gets a global
-            # request limiter.
-            if service == "dex":
-
-                wait_for_dex_slot()
-
-            response = session.get(
-                url,
-                timeout=timeout,
-                **kwargs
-            )
-
-            # ------------------------------------------------
-            # RATE LIMITED
-            # ------------------------------------------------
-
-            if response.status_code == 429:
-
-                retry_after = response.headers.get(
-                    "Retry-After"
-                )
-
-                if retry_after:
-
-                    try:
-                        wait = float(
-                            retry_after
-                        )
-                    except Exception:
-                        wait = 10
-                else:
-
-                    # Exponential backoff
-                    wait = min(
-                        10 * (2 ** (attempt - 1)),
-                        60
-                    )
-
-                log(
-                    f"⚠️ {service} rate limited "
-                    f"(429). Waiting {wait:.1f}s..."
-                )
-
-                time.sleep(wait)
-
-                continue
-
-            response.raise_for_status()
-
-            return response
-
-        except requests.RequestException as e:
-
-            log(
-                f"GET {service} attempt "
-                f"{attempt}/{MAX_RETRIES} failed: "
-                f"{str(e)[:180]}"
-            )
-
-            if attempt < MAX_RETRIES:
-
-                wait = min(
-                    3 * attempt,
-                    15
-                )
-
-                time.sleep(wait)
-
-    return None
-
-
-# ============================================================
-# HTTP POST
-# ============================================================
-
-def request_post(
-    url,
-    **kwargs
-):
-
-    timeout = kwargs.pop(
-        "timeout",
-        REQUEST_TIMEOUT
-    )
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-        try:
-
-            response = session.post(
-                url,
-                timeout=timeout,
-                **kwargs
-            )
-
-            if response.status_code == 429:
-
-                retry_after = response.headers.get(
-                    "Retry-After"
-                )
-
-                try:
-
-                    wait = (
-                        float(retry_after)
-                        if retry_after
-                        else 5
-                    )
-
-                except Exception:
-
-                    wait = 5
-
-                log(
-                    f"⚠️ POST rate limited. "
-                    f"Waiting {wait:.1f}s..."
-                )
-
-                time.sleep(wait)
-
-                continue
-
-            response.raise_for_status()
-
-            return response
-
-        except requests.RequestException as e:
-
-            log(
-                f"POST attempt "
-                f"{attempt}/{MAX_RETRIES} failed: "
-                f"{str(e)[:180]}"
-            )
-
-            if attempt < MAX_RETRIES:
-
-                time.sleep(
-                    min(3 * attempt, 15)
-                )
-
-    return None
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
 
 
 # ============================================================
@@ -403,74 +120,269 @@ def request_post(
 # ============================================================
 
 def load_seen():
+    global seen_tokens
 
     try:
+        if not os.path.exists(SEEN_FILE):
+            seen_tokens = set()
+            return
 
-        if not os.path.exists(
-            SEEN_FILE
-        ):
-
-            return set()
-
-        with open(
-            SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
         if isinstance(data, list):
+            seen_tokens = set(data)
 
-            return set(data)
+        elif isinstance(data, dict):
+            seen_tokens = set(data.keys())
+
+        else:
+            seen_tokens = set()
+
+        log(f"📂 Loaded {len(seen_tokens)} seen tokens")
 
     except Exception as e:
-
-        log(
-            f"Could not load seen tokens: {e}"
-        )
-
-    return set()
+        log(f"⚠️ Could not load seen tokens: {e}")
+        seen_tokens = set()
 
 
 def save_seen():
-
     try:
-
         with seen_lock:
+            data = list(seen_tokens)
 
-            data = sorted(
-                list(seen)
-            )
+        temp_file = SEEN_FILE + ".tmp"
 
-        with open(
-            SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
 
-            json.dump(
-                data,
-                file,
-                indent=2
-            )
+        os.replace(temp_file, SEEN_FILE)
 
     except Exception as e:
+        log(f"⚠️ Could not save seen tokens: {e}")
 
-        log(
-            f"Could not save seen tokens: {e}"
+
+def is_seen(address):
+    with seen_lock:
+        return address in seen_tokens
+
+
+def mark_seen(address):
+    with seen_lock:
+        seen_tokens.add(address)
+
+    save_seen()
+
+
+# ============================================================
+# HTTP REQUEST HELPERS
+# ============================================================
+
+def request_get(url, params=None, headers=None):
+    """
+    Normal GET request.
+
+    IMPORTANT:
+    429 is NOT aggressively retried.
+    This is one of the main fixes for the previous problem.
+    """
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+            response = session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            # ------------------------------------------------
+            # RATE LIMIT
+            # ------------------------------------------------
+
+            if response.status_code == 429:
+
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    wait_time = float(retry_after)
+                except (TypeError, ValueError):
+                    wait_time = 10
+
+                with stats_lock:
+                    stats["dex_429"] += 1
+
+                log(
+                    f"🛑 API rate limit (429). "
+                    f"Waiting {wait_time:.1f}s instead of retrying rapidly."
+                )
+
+                time.sleep(min(wait_time, 30))
+
+                # Do not immediately hammer the API again
+                return None
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException as e:
+
+            if attempt >= MAX_RETRIES:
+                log(
+                    f"⚠️ GET failed after {MAX_RETRIES} attempts: "
+                    f"{url}"
+                )
+                return None
+
+            wait_time = RETRY_DELAY * attempt
+
+            log(
+                f"⚠️ GET attempt {attempt} failed. "
+                f"Retrying in {wait_time}s..."
+            )
+
+            time.sleep(wait_time)
+
+        except Exception as e:
+
+            log(f"⚠️ Unexpected GET error: {e}")
+            return None
+
+    return None
+
+
+def request_post(url, json_data=None):
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+            response = session.post(
+                url,
+                json=json_data,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            if response.status_code == 429:
+
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    wait_time = float(retry_after)
+                except (TypeError, ValueError):
+                    wait_time = 10
+
+                log(
+                    f"🛑 POST rate limited. "
+                    f"Waiting {wait_time:.1f}s."
+                )
+
+                time.sleep(min(wait_time, 30))
+                return None
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException:
+
+            if attempt >= MAX_RETRIES:
+                return None
+
+            time.sleep(RETRY_DELAY * attempt)
+
+        except Exception as e:
+
+            log(f"⚠️ POST error: {e}")
+            return None
+
+    return None
+
+
+# ============================================================
+# DEXSCREENER RATE LIMITER
+# ============================================================
+
+def dex_rate_limit():
+    """
+    Guarantees a minimum delay between DexScreener requests.
+
+    This prevents several worker threads from simultaneously
+    hitting DexScreener.
+    """
+
+    global last_dex_request
+
+    with dex_lock:
+
+        now = time.time()
+
+        elapsed = now - last_dex_request
+
+        if elapsed < DEX_MIN_REQUEST_INTERVAL:
+
+            wait_time = DEX_MIN_REQUEST_INTERVAL - elapsed
+
+            time.sleep(wait_time)
+
+        last_dex_request = time.time()
+
+
+# ============================================================
+# DEXSCREENER
+# ============================================================
+
+def get_token_pair(mint_address):
+    """
+    Gets the best Solana pair from DexScreener.
+
+    Returns:
+        pair dictionary
+        None if not indexed yet / failed
+    """
+
+    dex_rate_limit()
+
+    url = DEXSCREENER_TOKEN + mint_address
+
+    response = request_get(url)
+
+    if response is None:
+        return None
+
+    try:
+        data = response.json()
+
+        pairs = data.get("pairs") or []
+
+        solana_pairs = [
+            p for p in pairs
+            if p.get("chainId") == "solana"
+        ]
+
+        if not solana_pairs:
+            return None
+
+        # Pick highest liquidity pair
+        best_pair = max(
+            solana_pairs,
+            key=lambda p: float(
+                (p.get("liquidity") or {}).get("usd") or 0
+            )
         )
+
+        return best_pair
+
+    except Exception as e:
+        log(f"⚠️ DexScreener JSON error: {e}")
+        return None
 
 
 # ============================================================
 # SOLANA RPC
 # ============================================================
 
-def rpc_call(
-    method,
-    params
-):
-
+def rpc_call(method, params):
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -480,320 +392,220 @@ def rpc_call(
 
     response = request_post(
         SOLANA_RPC,
-        json=payload
+        payload
     )
 
-    if not response:
-
+    if response is None:
         return None
 
     try:
-
-        data = response.json()
-
-        if data.get("error"):
-
-            log(
-                f"RPC error: "
-                f"{data['error']}"
-            )
-
-            return None
-
-        return data.get("result")
-
-    except Exception as e:
-
-        log(
-            f"RPC JSON error: {e}"
-        )
-
+        return response.json()
+    except Exception:
         return None
 
 
-# ============================================================
-# TOKEN AUTHORITIES
-# ============================================================
-
-def get_token_authorities(mint):
-
-    result = {
-        "mint_authority": None,
-        "freeze_authority": None,
-        "success": False
-    }
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getAccountInfo",
-        "params": [
-            mint,
-            {
-                "encoding": "jsonParsed",
-                "commitment": "confirmed"
-            }
-        ]
-    }
-
-    response = request_post(
-        SOLANA_RPC,
-        json=payload
-    )
-
-    if not response:
-
-        return result
+def get_token_authorities(mint_address):
+    """
+    Checks mint authority and freeze authority.
+    """
 
     try:
 
-        data = response.json()
-
-        value = (
-            data
-            .get("result", {})
-            .get("value")
+        data = rpc_call(
+            "getAccountInfo",
+            [
+                mint_address,
+                {
+                    "encoding": "jsonParsed"
+                }
+            ]
         )
 
-        if not value:
+        if not data:
+            return "Unknown", "Unknown"
 
-            return result
+        result = data.get("result", {}).get("value")
 
-        account_data = (
-            value.get("data")
-            or {}
-        )
+        if not result:
+            return "Unknown", "Unknown"
 
         parsed = (
-            account_data.get("parsed")
-            or {}
+            result
+            .get("data", {})
+            .get("parsed", {})
+            .get("info", {})
         )
 
-        info = (
-            parsed.get("info")
-            or {}
+        mint_authority = parsed.get("mintAuthority")
+        freeze_authority = parsed.get("freezeAuthority")
+
+        mint_status = (
+            "Revoked"
+            if mint_authority is None
+            else "Active"
         )
 
-        if parsed.get("type") != "mint":
-
-            return result
-
-        result["mint_authority"] = (
-            info.get("mintAuthority")
+        freeze_status = (
+            "Revoked"
+            if freeze_authority is None
+            else "Active"
         )
 
-        result["freeze_authority"] = (
-            info.get("freezeAuthority")
-        )
-
-        result["success"] = True
-
-        return result
+        return mint_status, freeze_status
 
     except Exception as e:
 
         log(
-            f"Authority error: {e}"
+            f"⚠️ Authority check failed for "
+            f"{mint_address}: {e}"
         )
 
-        return result
-
-
-def authority_status(authority):
-
-    if authority is None:
-        return "Revoked"
-
-    if authority == "":
-        return "Revoked"
-
-    return "Active"
-
-
-# ============================================================
-# DEXSCREENER
-# ============================================================
-
-def get_token_pair(mint):
-
-    response = request_get(
-        DEXSCREENER_TOKEN + mint,
-        service="dex"
-    )
-
-    if not response:
-
-        return None
-
-    try:
-
-        data = response.json()
-
-        pairs = (
-            data.get("pairs")
-            or []
-        )
-
-        solana_pairs = [
-            pair
-            for pair in pairs
-            if pair.get("chainId") == "solana"
-        ]
-
-        if not solana_pairs:
-
-            return None
-
-        solana_pairs.sort(
-            key=lambda p: safe_float(
-                (
-                    p.get("liquidity")
-                    or {}
-                ).get("usd")
-            ),
-            reverse=True
-        )
-
-        return solana_pairs[0]
-
-    except Exception as e:
-
-        log(
-            f"DexScreener JSON error: {e}"
-        )
-
-        return None
+        return "Unknown", "Unknown"
 
 
 # ============================================================
 # RUGCHECK
 # ============================================================
 
-def get_rugcheck_data(mint):
+def get_rugcheck_data(mint_address):
+    """
+    Gets holder count and top-10 concentration.
 
-    result = {
-        "holders": None,
-        "top10": None,
-        "risk": None
-    }
+    RugCheck response formats can change, so this function
+    checks several possible fields.
+    """
 
-    response = request_get(
-        RUGCHECK_REPORT.format(mint),
-        service="rugcheck"
-    )
+    url = RUGCHECK_REPORT.format(mint_address)
 
-    if not response:
+    response = request_get(url)
 
-        return result
+    if response is None:
+        return {
+            "holders": None,
+            "top10": None,
+            "risks": []
+        }
 
     try:
 
         data = response.json()
 
-        # ----------------------------------------------------
+        # -------------------------------
         # HOLDERS
-        # ----------------------------------------------------
+        # -------------------------------
 
-        holder_count = (
-            data.get("totalHolders")
-            or data.get("holderCount")
-            or data.get("holdersCount")
-        )
+        holders = data.get("totalHolders")
 
-        if holder_count is not None:
+        if holders is None:
+            holders = data.get("holdersCount")
 
-            result["holders"] = holder_count
+        if holders is None:
+            holders = data.get("holderCount")
 
-        # ----------------------------------------------------
+        try:
+            holders = int(holders) if holders is not None else None
+        except Exception:
+            holders = None
+
+        # -------------------------------
         # TOP 10
-        # ----------------------------------------------------
+        # -------------------------------
 
-        top_holders = data.get(
-            "topHolders"
-        )
+        top10 = None
 
-        if (
-            isinstance(top_holders, list)
-            and top_holders
-        ):
+        # Possible direct fields
+        possible_top10 = [
+            data.get("top10"),
+            data.get("top10Holders"),
+            data.get("topHoldersPercentage"),
+        ]
 
-            total_percentage = 0
+        for value in possible_top10:
 
-            for holder in top_holders[:10]:
+            if value is not None:
 
-                if not isinstance(
-                    holder,
-                    dict
-                ):
+                try:
+                    top10 = float(value)
 
-                    continue
+                    if top10 <= 1:
+                        top10 *= 100
 
-                percentage = safe_float(
-                    holder.get("pct")
-                    or holder.get("percentage")
-                    or holder.get(
-                        "ownershipPercentage"
+                    break
+
+                except Exception:
+                    pass
+
+        # Try topHolders array
+        if top10 is None:
+
+            top_holders = data.get("topHolders")
+
+            if isinstance(top_holders, list):
+
+                total = 0.0
+
+                for holder in top_holders[:10]:
+
+                    pct = (
+                        holder.get("pct")
+                        if isinstance(holder, dict)
+                        else None
                     )
-                )
 
-                if 0 < percentage <= 1:
+                    if pct is None and isinstance(holder, dict):
+                        pct = holder.get("percentage")
 
-                    percentage *= 100
+                    try:
+                        pct = float(pct)
 
-                total_percentage += percentage
+                        if pct <= 1:
+                            pct *= 100
 
-            if total_percentage > 0:
+                        total += pct
 
-                result["top10"] = (
-                    total_percentage
-                )
+                    except Exception:
+                        continue
 
-        # ----------------------------------------------------
+                if total > 0:
+                    top10 = total
+
+        # -------------------------------
         # RISKS
-        # ----------------------------------------------------
+        # -------------------------------
 
-        risks = data.get("risks")
+        risks = []
 
-        if isinstance(risks, list):
+        raw_risks = data.get("risks")
 
-            names = []
+        if isinstance(raw_risks, list):
 
-            for risk in risks:
+            for risk in raw_risks[:10]:
 
-                if not isinstance(
-                    risk,
-                    dict
-                ):
+                if isinstance(risk, dict):
 
-                    continue
+                    name = risk.get("name") or risk.get("description")
 
-                name = (
-                    risk.get("name")
-                    or risk.get("description")
-                    or risk.get("level")
-                )
+                    if name:
+                        risks.append(str(name))
 
-                if name:
+                else:
+                    risks.append(str(risk))
 
-                    names.append(
-                        str(name)
-                    )
-
-            if names:
-
-                result["risk"] = ", ".join(
-                    names[:5]
-                )
-
-        return result
+        return {
+            "holders": holders,
+            "top10": top10,
+            "risks": risks
+        }
 
     except Exception as e:
 
-        log(
-            f"RugCheck JSON error: {e}"
-        )
+        log(f"⚠️ RugCheck error: {e}")
 
-        return result
+        return {
+            "holders": None,
+            "top10": None,
+            "risks": []
+        }
 
 
 # ============================================================
@@ -801,366 +613,89 @@ def get_rugcheck_data(mint):
 # ============================================================
 
 def get_age_minutes(pair):
+    created = pair.get("pairCreatedAt")
+
+    if not created:
+        return None
 
     try:
 
-        created = pair.get(
-            "pairCreatedAt"
-        )
+        # DexScreener normally gives milliseconds
+        created_seconds = float(created) / 1000
 
-        if not created:
+        age_seconds = time.time() - created_seconds
 
-            return None
-
-        created_seconds = (
-            float(created) / 1000
-        )
-
-        now = datetime.now(
-            timezone.utc
-        ).timestamp()
-
-        age_seconds = max(
-            0,
-            now - created_seconds
-        )
-
-        return int(
-            age_seconds / 60
-        )
+        return max(0, age_seconds / 60)
 
     except Exception:
-
         return None
 
 
-def format_age(age_minutes):
+# ============================================================
+# FORMATTING
+# ============================================================
 
-    if age_minutes is None:
+def money(value):
+    try:
+        return f"${float(value):,.0f}"
+    except Exception:
+        return "$0"
 
+
+def format_age(age):
+    if age is None:
         return "Unknown"
 
-    if age_minutes < 60:
+    if age < 1:
+        return f"{int(age * 60)} sec"
 
-        return f"{age_minutes} min"
-
-    hours = age_minutes // 60
-
-    if hours < 24:
-
-        return f"{hours} hr"
-
-    days = hours // 24
-
-    return f"{days} day"
+    return f"{age:.1f} min"
 
 
 # ============================================================
 # RISK FLAGS
 # ============================================================
 
-def evaluate_top10(top10):
-
-    if top10 is None:
-
-        return "⚪ Top 10: Unknown"
-
-    if top10 <= TOP10_GREEN:
-
-        return f"🟢 Top 10: {top10:.1f}%"
-
-    if top10 <= TOP10_YELLOW:
-
-        return f"🟡 Top 10: {top10:.1f}%"
-
-    return f"🔴 Top 10: {top10:.1f}%"
-
-
-def evaluate_liquidity_mc(
-    liquidity,
-    mc
-):
-
-    if mc <= 0:
-
-        return "⚪ Liquidity/MC: Unknown"
-
-    ratio = (
-        liquidity / mc
-    ) * 100
-
-    if ratio >= LIQ_MC_GREEN:
-
-        emoji = "🟢"
-
-    elif ratio >= LIQ_MC_YELLOW:
-
-        emoji = "🟡"
-
-    else:
-
-        emoji = "🔴"
-
-    return (
-        f"{emoji} Liquidity/MC: "
-        f"{ratio:.1f}%"
-    )
-
-
-def evaluate_volume_mc(
-    volume,
-    mc
-):
-
-    if mc <= 0:
-
-        return "⚪ Volume/MC: Unknown"
-
-    ratio = volume / mc
-
-    if ratio <= VOL_MC_GREEN_MAX:
-
-        emoji = "🟢"
-
-    elif ratio <= VOL_MC_YELLOW_MAX:
-
-        emoji = "🟡"
-
-    else:
-
-        emoji = "🔴"
-
-    return (
-        f"{emoji} Volume/MC: "
-        f"{ratio:.1f}x"
-    )
-
-
-def evaluate_holders(holders):
-
-    if holders is None:
-
-        return "⚪ Holders: Unknown"
-
-    holders = int(
-        safe_float(holders)
-    )
-
-    if holders >= HOLDERS_GREEN:
-
-        emoji = "🟢"
-
-    elif holders >= HOLDERS_YELLOW:
-
-        emoji = "🟡"
-
-    else:
-
-        emoji = "🔴"
-
-    return (
-        f"{emoji} Holders: "
-        f"{holders:,}"
-    )
-
-
-def evaluate_age(age_minutes):
-
-    if age_minutes is None:
-
-        return "⚪ Age: Unknown"
-
-    if age_minutes >= AGE_GREEN:
-
-        emoji = "🟢"
-
-    elif age_minutes >= AGE_YELLOW:
-
-        emoji = "🟡"
-
-    else:
-
-        emoji = "🔴"
-
-    return (
-        f"{emoji} Age: "
-        f"{format_age(age_minutes)}"
-    )
-
-
-def calculate_overall_risk(levels):
-
-    high = levels.count("HIGH")
-    medium = levels.count("MEDIUM")
-
-    if high >= 2:
-
-        return "HIGH"
-
-    if high >= 1 and medium >= 1:
-
-        return "HIGH"
-
-    if high == 1:
-
-        return "MEDIUM"
-
-    if medium >= 1:
-
-        return "MEDIUM"
-
-    return "LOW"
-
-
 def build_risk_flags(
-    top10,
-    liquidity,
     mc,
-    volume,
+    liquidity,
     holders,
-    age_minutes
+    top10,
+    age,
+    volume
 ):
 
-    levels = []
+    flags = []
 
-    # TOP 10
-    if top10 is None:
+    if top10 is not None:
 
-        top10_level = "UNKNOWN"
+        if top10 >= 50:
+            flags.append("⚠️ Top 10 concentration > 50%")
 
-    elif top10 <= TOP10_GREEN:
+        elif top10 >= 35:
+            flags.append("⚠️ Top 10 concentration > 35%")
 
-        top10_level = "LOW"
+    if mc and liquidity:
 
-    elif top10 <= TOP10_YELLOW:
+        ratio = liquidity / mc
 
-        top10_level = "MEDIUM"
+        if ratio < 0.05:
+            flags.append("⚠️ Low liquidity/MC ratio")
 
-    else:
+    if mc and volume:
 
-        top10_level = "HIGH"
+        volume_ratio = volume / mc
 
-    if top10_level != "UNKNOWN":
+        if volume_ratio > 20:
+            flags.append("⚠️ Unusually high volume/MC")
 
-        levels.append(top10_level)
+    if holders is not None and holders < 100:
+        flags.append("⚠️ Low holder count")
 
-    # LIQUIDITY / MC
-    if mc <= 0:
+    if age is not None and age < 2:
+        flags.append("⚠️ Very new token")
 
-        liq_level = "UNKNOWN"
-
-    else:
-
-        ratio = (
-            liquidity / mc
-        ) * 100
-
-        if ratio >= LIQ_MC_GREEN:
-
-            liq_level = "LOW"
-
-        elif ratio >= LIQ_MC_YELLOW:
-
-            liq_level = "MEDIUM"
-
-        else:
-
-            liq_level = "HIGH"
-
-    if liq_level != "UNKNOWN":
-
-        levels.append(liq_level)
-
-    # VOLUME / MC
-    if mc <= 0:
-
-        vol_level = "UNKNOWN"
-
-    else:
-
-        ratio = volume / mc
-
-        if ratio <= VOL_MC_GREEN_MAX:
-
-            vol_level = "LOW"
-
-        elif ratio <= VOL_MC_YELLOW_MAX:
-
-            vol_level = "MEDIUM"
-
-        else:
-
-            vol_level = "HIGH"
-
-    if vol_level != "UNKNOWN":
-
-        levels.append(vol_level)
-
-    # HOLDERS
-    if holders is None:
-
-        holder_level = "UNKNOWN"
-
-    elif holders >= HOLDERS_GREEN:
-
-        holder_level = "LOW"
-
-    elif holders >= HOLDERS_YELLOW:
-
-        holder_level = "MEDIUM"
-
-    else:
-
-        holder_level = "HIGH"
-
-    if holder_level != "UNKNOWN":
-
-        levels.append(holder_level)
-
-    # AGE
-    if age_minutes is None:
-
-        age_level = "UNKNOWN"
-
-    elif age_minutes >= AGE_GREEN:
-
-        age_level = "LOW"
-
-    elif age_minutes >= AGE_YELLOW:
-
-        age_level = "MEDIUM"
-
-    else:
-
-        age_level = "HIGH"
-
-    if age_level != "UNKNOWN":
-
-        levels.append(age_level)
-
-    overall = calculate_overall_risk(
-        levels
-    )
-
-    text = "\n".join([
-        evaluate_top10(top10),
-        evaluate_liquidity_mc(
-            liquidity,
-            mc
-        ),
-        evaluate_volume_mc(
-            volume,
-            mc
-        ),
-        evaluate_holders(
-            holders
-        ),
-        evaluate_age(
-            age_minutes
-        )
-    ])
-
-    return text, overall
+    return flags
 
 
 # ============================================================
@@ -1168,40 +703,29 @@ def build_risk_flags(
 # ============================================================
 
 def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
         log(
-            "❌ TELEGRAM_BOT_TOKEN missing"
+            "⚠️ Telegram credentials missing. "
+            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
         )
 
         return False
 
-    if not TELEGRAM_CHAT_ID:
-
-        log(
-            "❌ TELEGRAM_CHAT_ID missing"
-        )
-
-        return False
-
-    url = TELEGRAM_API.format(
-        TELEGRAM_BOT_TOKEN
-    )
+    url = TELEGRAM_API.format(TELEGRAM_BOT_TOKEN)
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "disable_web_page_preview": False
+        "disable_web_page_preview": True
     }
 
     response = request_post(
         url,
-        json=payload
+        payload
     )
 
-    if not response:
-
+    if response is None:
         return False
 
     try:
@@ -1209,322 +733,313 @@ def send_telegram(message):
         data = response.json()
 
         if data.get("ok"):
-
             return True
 
-        log(
-            f"Telegram API error: {data}"
-        )
+        log(f"⚠️ Telegram rejected message: {data}")
+        return False
 
     except Exception:
-
-        pass
-
-    return False
+        return False
 
 
 # ============================================================
-# BUILD ALERT
+# TELEGRAM ALERT
 # ============================================================
 
 def build_alert(
-    pair,
-    mint,
-    security,
-    authorities
+    name,
+    symbol,
+    mint_address,
+    mc,
+    liquidity,
+    holders,
+    age,
+    volume,
+    mint_status,
+    freeze_status,
+    top10,
+    risks
 ):
 
-    base_token = (
-        pair.get("baseToken")
-        or {}
+    dex_link = (
+        f"https://dexscreener.com/solana/"
+        f"{mint_address}"
     )
 
-    name = (
-        base_token.get("name")
-        or "Unknown"
+    rug_link = (
+        f"https://rugcheck.xyz/tokens/"
+        f"{mint_address}"
     )
 
-    symbol = (
-        base_token.get("symbol")
-        or "UNKNOWN"
+    pump_link = (
+        f"https://pump.fun/coin/"
+        f"{mint_address}"
     )
 
-    mc = safe_float(
-        pair.get("marketCap")
-        or pair.get("fdv")
-    )
-
-    liquidity = safe_float(
-        (
-            pair.get("liquidity")
-            or {}
-        ).get("usd")
-    )
-
-    volume = safe_float(
-        (
-            pair.get("volume")
-            or {}
-        ).get("h24")
-    )
-
-    holders = security.get(
-        "holders"
-    )
-
-    holders_text = (
-        format_number(holders)
-        if holders is not None
-        else "Unknown"
-    )
-
-    top10 = security.get(
-        "top10"
-    )
-
-    top10_text = (
-        f"{top10:.1f}%"
-        if top10 is not None
-        else "Unknown"
-    )
-
-    if authorities.get("success"):
-
-        mint_status = authority_status(
-            authorities.get(
-                "mint_authority"
-            )
-        )
-
-        freeze_status = authority_status(
-            authorities.get(
-                "freeze_authority"
-            )
-        )
-
+    if holders is None:
+        holder_text = "Unknown"
     else:
+        holder_text = f"{holders:,}"
 
-        mint_status = "Unknown"
-        freeze_status = "Unknown"
-
-    age_minutes = get_age_minutes(
-        pair
-    )
-
-    age = format_age(
-        age_minutes
-    )
-
-    risk_text, overall = build_risk_flags(
-        top10,
-        liquidity,
-        mc,
-        volume,
-        holders,
-        age_minutes
-    )
-
-    if overall == "LOW":
-
-        overall_emoji = "🟢"
-
-    elif overall == "MEDIUM":
-
-        overall_emoji = "🟡"
-
+    if top10 is None:
+        top10_text = "Unknown"
     else:
+        top10_text = f"{top10:.1f}%"
 
-        overall_emoji = "🔴"
-
-    dex_url = (
-        pair.get("url")
-        or
-        f"https://dexscreener.com/solana/{mint}"
+    message = (
+        "🚨 NEW SOLANA TOKEN\n\n"
+        f"Name: {name}\n"
+        f"Symbol: ${symbol}\n"
+        f"CA: `{mint_address}`\n\n"
+        f"💰 MC: {money(mc)}\n"
+        f"💧 Liquidity: {money(liquidity)}\n"
+        f"👥 Holders: {holder_text}\n"
+        f"⏱ Age: {format_age(age)}\n"
+        f"📊 Volume: {money(volume)}\n\n"
+        f"🔒 Mint: {mint_status}\n"
+        f"❄️ Freeze: {freeze_status}\n"
+        f"🐋 Top 10: {top10_text}\n"
     )
 
-    rug_url = (
-        f"https://rugcheck.xyz/tokens/{mint}"
+    if risks:
+
+        message += "\n⚠️ Risk Flags:\n"
+
+        for risk in risks[:6]:
+            message += f"• {risk}\n"
+
+    message += (
+        "\n🔗 DexScreener:\n"
+        f"{dex_link}\n\n"
+        "🔍 RugCheck:\n"
+        f"{rug_link}\n\n"
+        "🚀 Pump.fun:\n"
+        f"{pump_link}\n\n"
+        "⚠️ DYOR. This is only a scanner alert, "
+        "not financial advice."
     )
-
-    pump_url = (
-        f"https://pump.fun/coin/{mint}"
-    )
-
-    message = f"""🚨 NEW PUMP.FUN TOKEN
-
-Name: {name} ({symbol})
-
-CA:
-{mint}
-
-💰 MC: {format_money(mc)}
-💧 Liquidity: {format_money(liquidity)}
-👥 Holders: {format_number(holders)}
-⏱ Age: {age}
-📊 Volume 24h: {format_money(volume)}
-
-🔒 Mint: {mint_status}
-❄️ Freeze: {freeze_status}
-🐋 Top 10: {top10_text}
-
-🛡️ RISK FLAGS
-
-{risk_text}
-
-{overall_emoji} OVERALL RISK: {overall}
-
-🔗 Pump.fun:
-{pump_url}
-
-🔗 DexScreener:
-{dex_url}
-
-🔍 RugCheck:
-{rug_url}
-
-⚠️ DYOR — New/low-cap tokens are extremely risky.
-"""
 
     return message
 
 
 # ============================================================
-# QUEUE MANAGEMENT
+# TOKEN SCHEDULING
 # ============================================================
 
-def enqueue_token(
-    mint,
-    launch_data
-):
+def add_new_token(data):
+    """
+    Adds a newly discovered Pump.fun token.
 
-    if not mint:
+    IMPORTANT:
+    We only add it once.
+    """
 
-        return False
+    mint_address = (
+        data.get("mint")
+        or data.get("token")
+        or data.get("address")
+    )
 
-    with seen_lock:
+    if not mint_address:
+        return
 
-        if mint in seen:
+    if is_seen(mint_address):
+        return
 
-            return False
+    with pending_lock:
 
-    with queued_lock:
+        if mint_address in pending_tokens:
+            return
 
-        if mint in queued_tokens:
+        if len(pending_tokens) >= MAX_PENDING_TOKENS:
 
-            return False
+            log(
+                f"⚠️ Pending token limit reached. "
+                f"Ignoring new token: {mint_address}"
+            )
 
-        queued_tokens.add(mint)
+            return
 
-    try:
+        now = time.time()
 
-        token_queue.put_nowait({
-            "mint": mint,
-            "launch_data": launch_data
-        })
+        pending_tokens[mint_address] = {
+            "data": data,
+            "first_seen": now,
+            "last_checked": 0,
+            "next_check": now,
+            "attempts": 0,
+            "queued": False
+        }
 
-        return True
+    with stats_lock:
+        stats["detected"] += 1
 
-    except queue.Full:
+    name = data.get("name") or "Unknown"
+    symbol = data.get("symbol") or "UNKNOWN"
+    dev = data.get("traderPublicKey") or data.get("creator") or "Unknown"
+    pump_mc = data.get("marketCapSol")
 
-        with queued_lock:
+    log("🟢 NEW PUMP.FUN LAUNCH")
+    log(f"   Name: {name} ({symbol})")
+    log(f"   CA: {mint_address}")
+    log(f"   Dev: {dev}")
+    log(f"   Pump MC SOL: {pump_mc}")
 
-            queued_tokens.discard(mint)
 
-        return False
+# ============================================================
+# REMOVE TOKEN FROM PENDING
+# ============================================================
+
+def remove_pending(mint_address):
+
+    with pending_lock:
+        pending_tokens.pop(mint_address, None)
 
 
-def remove_from_queue_state(mint):
+# ============================================================
+# RESCHEDULE
+# ============================================================
 
-    with queued_lock:
+def reschedule_token(mint_address, delay):
 
-        queued_tokens.discard(mint)
+    with pending_lock:
+
+        token = pending_tokens.get(mint_address)
+
+        if not token:
+            return
+
+        token["next_check"] = time.time() + delay
+        token["queued"] = False
 
 
 # ============================================================
 # CHECK TOKEN
 # ============================================================
 
-def check_token(
-    mint,
-    launch_data
-):
+def check_token(mint_address):
 
-    with seen_lock:
+    with pending_lock:
 
-        if mint in seen:
+        token = pending_tokens.get(mint_address)
 
+        if not token:
             return
 
-    pair = get_token_pair(
-        mint
-    )
+        data = token["data"]
+        first_seen = token["first_seen"]
 
+        token["last_checked"] = time.time()
+        token["attempts"] += 1
+
+        attempt = token["attempts"]
+
+    elapsed_minutes = (
+        time.time() - first_seen
+    ) / 60
+
+    # --------------------------------------------------------
+    # EXPIRE TOKEN
+    # --------------------------------------------------------
+
+    if elapsed_minutes > MONITOR_MAX_MINUTES:
+
+        log(
+            f"⌛ Token expired: {mint_address}"
+        )
+
+        remove_pending(mint_address)
+
+        with stats_lock:
+            stats["expired"] += 1
+
+        return
+
+    # --------------------------------------------------------
+    # DEXSCREENER
+    # --------------------------------------------------------
+
+    pair = get_token_pair(mint_address)
+
+    with stats_lock:
+        stats["checked"] += 1
+
+    # No DexScreener pair yet
     if not pair:
 
         log(
             f"⏳ No DexScreener pair yet: "
-            f"{mint}"
+            f"{mint_address}"
+        )
+
+        # Gradually increase wait time
+        if attempt <= 2:
+            delay = 10
+        elif attempt <= 5:
+            delay = 20
+        elif attempt <= 10:
+            delay = 30
+        else:
+            delay = 60
+
+        reschedule_token(
+            mint_address,
+            delay
         )
 
         return
 
-    mc = safe_float(
-        pair.get("marketCap")
-        or pair.get("fdv")
-    )
+    # --------------------------------------------------------
+    # GET MARKET DATA
+    # --------------------------------------------------------
 
-    liquidity = safe_float(
-        (
-            pair.get("liquidity")
-            or {}
-        ).get("usd")
-    )
+    try:
 
-    age_minutes = get_age_minutes(
-        pair
-    )
+        mc = float(
+            pair.get("marketCap")
+            or pair.get("fdv")
+            or 0
+        )
+
+        liquidity = float(
+            (pair.get("liquidity") or {}).get("usd")
+            or 0
+        )
+
+        volume = float(
+            (pair.get("volume") or {}).get("h24")
+            or 0
+        )
+
+    except Exception as e:
+
+        log(
+            f"⚠️ Market data error "
+            f"{mint_address}: {e}"
+        )
+
+        reschedule_token(
+            mint_address,
+            20
+        )
+
+        return
+
+    age = get_age_minutes(pair)
 
     # --------------------------------------------------------
     # AGE
     # --------------------------------------------------------
 
-    if age_minutes is not None:
-
-        if age_minutes > MONITOR_MAX_MINUTES:
-
-            log(
-                f"⌛ Token expired: "
-                f"{mint}"
-            )
-
-            with pending_lock:
-
-                pending.pop(
-                    mint,
-                    None
-                )
-
-            return
-
-    # --------------------------------------------------------
-    # MC TOO HIGH
-    # --------------------------------------------------------
-
-    if mc > MAX_MC:
+    if age is not None and age > MONITOR_MAX_MINUTES:
 
         log(
-            f"⬆️ MC above "
-            f"${MAX_MC:,}: "
-            f"{mint} | "
-            f"{format_money(mc)}"
+            f"⌛ Token too old: "
+            f"{mint_address} | "
+            f"{age:.1f} min"
         )
 
-        with pending_lock:
-
-            pending.pop(
-                mint,
-                None
-            )
+        remove_pending(mint_address)
 
         return
 
@@ -1535,16 +1050,36 @@ def check_token(
     if mc < MIN_MC:
 
         log(
-            f"⏳ MC below "
-            f"${MIN_MC:,}: "
-            f"{mint} | "
-            f"{format_money(mc)}"
+            f"⏳ MC below ${MIN_MC:,}: "
+            f"{mint_address} | "
+            f"${mc:,.0f}"
+        )
+
+        reschedule_token(
+            mint_address,
+            15
         )
 
         return
 
     # --------------------------------------------------------
-    # LIQUIDITY
+    # MC TOO HIGH
+    # --------------------------------------------------------
+
+    if mc > MAX_MC:
+
+        log(
+            f"🚫 MC above ${MAX_MC:,}: "
+            f"{mint_address} | "
+            f"${mc:,.0f}"
+        )
+
+        remove_pending(mint_address)
+
+        return
+
+    # --------------------------------------------------------
+    # LIQUIDITY TOO LOW
     # --------------------------------------------------------
 
     if liquidity < MIN_LIQUIDITY:
@@ -1552,90 +1087,166 @@ def check_token(
         log(
             f"💧 Liquidity below "
             f"${MIN_LIQUIDITY:,}: "
-            f"{mint} | "
-            f"{format_money(liquidity)}"
+            f"{mint_address} | "
+            f"${liquidity:,.0f}"
+        )
+
+        reschedule_token(
+            mint_address,
+            15
         )
 
         return
+
+    # --------------------------------------------------------
+    # MARKET CONDITIONS PASSED
+    # --------------------------------------------------------
+
+    log(
+        f"✅ Market filters passed: "
+        f"{mint_address} | "
+        f"MC ${mc:,.0f} | "
+        f"Liq ${liquidity:,.0f}"
+    )
 
     # --------------------------------------------------------
     # RUGCHECK
     # --------------------------------------------------------
 
-    security = get_rugcheck_data(
-        mint
-    )
+    rug = get_rugcheck_data(mint_address)
 
-    holders = security.get(
-        "holders"
-    )
+    holders = rug.get("holders")
+    top10 = rug.get("top10")
+    rug_risks = rug.get("risks") or []
 
-    if (
-        holders is None
-        or safe_float(holders) < MIN_HOLDERS
-    ):
+    # --------------------------------------------------------
+    # HOLDER FILTER
+    # --------------------------------------------------------
+
+    if holders is None:
+
+        log(
+            f"⚠️ Holder count unavailable: "
+            f"{mint_address}"
+        )
+
+        reschedule_token(
+            mint_address,
+            30
+        )
+
+        return
+
+    if holders < MIN_HOLDERS:
 
         log(
             f"👥 Holders below "
             f"{MIN_HOLDERS}: "
-            f"{mint} | "
-            f"{holders if holders is not None else 'Unknown'}"
+            f"{mint_address} | "
+            f"{holders}"
+        )
+
+        reschedule_token(
+            mint_address,
+            20
         )
 
         return
 
     # --------------------------------------------------------
-    # AUTHORITIES
+    # SECURITY CHECKS
     # --------------------------------------------------------
 
-    authorities = get_token_authorities(
-        mint
+    mint_status, freeze_status = (
+        get_token_authorities(mint_address)
     )
 
     # --------------------------------------------------------
-    # QUALIFIED
+    # TOKEN NAME
     # --------------------------------------------------------
 
-    log(
-        f"🔥 QUALIFIED TOKEN: "
-        f"{mint} | "
-        f"MC={format_money(mc)} | "
-        f"Liquidity={format_money(liquidity)} | "
-        f"Holders={format_number(holders)}"
+    name = (
+        data.get("name")
+        or pair.get("baseToken", {}).get("name")
+        or "Unknown"
     )
 
-    message = build_alert(
-        pair,
-        mint,
-        security,
-        authorities
+    symbol = (
+        data.get("symbol")
+        or pair.get("baseToken", {}).get("symbol")
+        or "UNKNOWN"
     )
 
-    if send_telegram(message):
+    # --------------------------------------------------------
+    # RISK FLAGS
+    # --------------------------------------------------------
+
+    risk_flags = build_risk_flags(
+        mc=mc,
+        liquidity=liquidity,
+        holders=holders,
+        top10=top10,
+        age=age,
+        volume=volume
+    )
+
+    # Add RugCheck risks
+    for risk in rug_risks:
+
+        text = str(risk)
+
+        if text not in risk_flags:
+            risk_flags.append(
+                f"RugCheck: {text}"
+            )
+
+    # --------------------------------------------------------
+    # ALERT
+    # --------------------------------------------------------
+
+    alert = build_alert(
+        name=name,
+        symbol=symbol,
+        mint_address=mint_address,
+        mc=mc,
+        liquidity=liquidity,
+        holders=holders,
+        age=age,
+        volume=volume,
+        mint_status=mint_status,
+        freeze_status=freeze_status,
+        top10=top10,
+        risks=risk_flags
+    )
+
+    success = send_telegram(alert)
+
+    if success:
 
         log(
-            f"✅ Telegram alert sent: "
-            f"{mint}"
+            f"🚨 TELEGRAM ALERT SENT: "
+            f"{mint_address}"
         )
 
-        with seen_lock:
+        mark_seen(mint_address)
 
-            seen.add(mint)
+        remove_pending(mint_address)
 
-        save_seen()
-
-        with pending_lock:
-
-            pending.pop(
-                mint,
-                None
-            )
+        with stats_lock:
+            stats["alerts"] += 1
 
     else:
 
         log(
-            f"❌ Telegram failed: "
-            f"{mint}"
+            f"⚠️ Telegram alert failed: "
+            f"{mint_address}"
+        )
+
+        # Keep it pending in case Telegram/API
+        # temporarily failed.
+        reschedule_token(
+            mint_address,
+            60
         )
 
 
@@ -1643,360 +1254,245 @@ def check_token(
 # WORKER
 # ============================================================
 
-def worker():
+def worker(worker_id):
+
+    log(f"👷 Worker {worker_id} started")
 
     while True:
 
         try:
 
-            item = token_queue.get()
-
-            if item is None:
-
-                token_queue.task_done()
-
-                continue
-
-            mint = item.get(
-                "mint"
+            mint_address = work_queue.get(
+                timeout=5
             )
 
-            launch_data = item.get(
-                "launch_data"
-            )
+        except queue.Empty:
+            continue
 
-            try:
+        try:
 
-                check_token(
-                    mint,
-                    launch_data
-                )
-
-            except Exception as e:
-
-                log(
-                    f"Worker error for "
-                    f"{mint}: {e}"
-                )
-
-            finally:
-
-                remove_from_queue_state(
-                    mint
-                )
-
-                token_queue.task_done()
+            check_token(mint_address)
 
         except Exception as e:
 
             log(
-                f"Worker loop error: {e}"
+                f"❌ Worker {worker_id} error "
+                f"on {mint_address}: {e}"
             )
 
-            time.sleep(2)
-
-
-# ============================================================
-# PENDING MONITOR
-# ============================================================
-
-def pending_monitor():
-
-    while True:
-
-        try:
-
-            time.sleep(
-                MONITOR_INTERVAL
+            reschedule_token(
+                mint_address,
+                30
             )
 
-            now = time.time()
+        finally:
 
             with pending_lock:
 
-                items = list(
-                    pending.items()
+                token = pending_tokens.get(
+                    mint_address
                 )
 
-            # ------------------------------------------------
-            # Only enqueue a limited number
-            # during each cycle.
-            # ------------------------------------------------
+                if token:
+                    token["queued"] = False
 
-            added = 0
+            work_queue.task_done()
 
-            for mint, data in items:
 
-                if added >= WORKER_COUNT:
+# ============================================================
+# SCHEDULER
+# ============================================================
 
-                    break
+def scheduler():
 
-                first_seen = data.get(
-                    "first_seen",
-                    now
-                )
+    log("⏱ Token scheduler started")
 
-                age_seconds = (
-                    now - first_seen
-                )
+    while True:
 
-                if age_seconds > (
-                    MONITOR_MAX_MINUTES * 60
-                ):
+        now = time.time()
 
-                    with pending_lock:
+        candidates = []
 
-                        pending.pop(
-                            mint,
-                            None
-                        )
+        with pending_lock:
 
-                    log(
-                        f"⌛ Monitoring expired: "
-                        f"{mint}"
-                    )
+            for mint_address, token in pending_tokens.items():
 
+                if token.get("queued"):
                     continue
 
-                with queued_lock:
-
-                    already_queued = (
-                        mint in queued_tokens
-                    )
-
-                if already_queued:
-
+                if token.get("next_check", 0) > now:
                     continue
 
-                if enqueue_token(
-                    mint,
-                    data.get(
-                        "launch_data"
+                candidates.append(
+                    mint_address
+                )
+
+        # Queue only a small number at a time
+        for mint_address in candidates:
+
+            if work_queue.full():
+
+                with stats_lock:
+                    stats["queue_full"] += 1
+
+                break
+
+            with pending_lock:
+
+                token = pending_tokens.get(
+                    mint_address
+                )
+
+                if not token:
+                    continue
+
+                if token.get("queued"):
+                    continue
+
+                token["queued"] = True
+
+            try:
+
+                work_queue.put_nowait(
+                    mint_address
+                )
+
+            except queue.Full:
+
+                with pending_lock:
+
+                    token = pending_tokens.get(
+                        mint_address
                     )
-                ):
 
-                    added += 1
+                    if token:
+                        token["queued"] = False
 
-        except Exception as e:
+                with stats_lock:
+                    stats["queue_full"] += 1
 
-            log(
-                f"Pending monitor error: {e}"
+                break
+
+        time.sleep(2)
+
+
+# ============================================================
+# STATUS MONITOR
+# ============================================================
+
+def status_monitor():
+
+    while True:
+
+        time.sleep(30)
+
+        with pending_lock:
+            pending_count = len(
+                pending_tokens
             )
 
-            time.sleep(3)
+        queue_count = work_queue.qsize()
 
-
-# ============================================================
-# ADD NEW TOKEN
-# ============================================================
-
-def add_new_token(event):
-
-    mint = event.get(
-        "mint"
-    )
-
-    if not mint:
-
-        return
-
-    with seen_lock:
-
-        if mint in seen:
-
-            return
-
-    with pending_lock:
-
-        if mint in pending:
-
-            return
-
-        # Keep pending list bounded.
-        if len(pending) >= MAX_PENDING_TOKENS:
-
-            log(
-                "⚠️ Pending list full. "
-                "Ignoring newest token temporarily."
+        with seen_lock:
+            seen_count = len(
+                seen_tokens
             )
 
-            return
+        with stats_lock:
 
-        pending[mint] = {
-            "first_seen": time.time(),
-            "launch_data": event
-        }
+            detected = stats["detected"]
+            checked = stats["checked"]
+            alerts = stats["alerts"]
+            expired = stats["expired"]
+            dex_429 = stats["dex_429"]
+            queue_full = stats["queue_full"]
 
-    name = (
-        event.get("name")
-        or "Unknown"
-    )
-
-    symbol = (
-        event.get("symbol")
-        or "UNKNOWN"
-    )
-
-    log(
-        "🟢 NEW PUMP.FUN LAUNCH"
-    )
-
-    log(
-        f"   Name: {name} ({symbol})"
-    )
-
-    log(
-        f"   CA: {mint}"
-    )
-
-    log(
-        f"   Dev: "
-        f"{event.get('traderPublicKey', 'Unknown')}"
-    )
-
-    log(
-        f"   Pump MC SOL: "
-        f"{event.get('marketCapSol', 'Unknown')}"
-    )
-
-    # Try immediately once.
-    if enqueue_token(
-        mint,
-        event
-    ):
-
-        return
-
-    log(
-        f"⏳ Added to pending monitor: "
-        f"{mint}"
-    )
+        log(
+            "📊 STATUS | "
+            f"Pending: {pending_count} | "
+            f"Queue: {queue_count} | "
+            f"Detected: {detected} | "
+            f"Checked: {checked} | "
+            f"Alerts: {alerts} | "
+            f"Seen: {seen_count} | "
+            f"Expired: {expired} | "
+            f"429s: {dex_429} | "
+            f"QueueFull: {queue_full}"
+        )
 
 
 # ============================================================
-# WEBSOCKET STATE
+# PUMPPORTAL WEBSOCKET
 # ============================================================
 
-last_event_time = time.time()
+def on_open(ws):
 
+    log("🟢 Connected to PumpPortal")
 
-# ============================================================
-# WEBSOCKET MESSAGE
-# ============================================================
-
-def on_message(
-    ws,
-    message
-):
-
-    global last_event_time
-
-    last_event_time = time.time()
+    subscription = {
+        "method": "subscribeNewToken"
+    }
 
     try:
 
-        if not message:
-
-            return
-
-        data = json.loads(
-            message
+        ws.send(
+            json.dumps(subscription)
         )
-
-        if not isinstance(
-            data,
-            dict
-        ):
-
-            return
-
-        tx_type = data.get(
-            "txType"
-        )
-
-        if tx_type != "create":
-
-            return
-
-        add_new_token(
-            data
-        )
-
-    except json.JSONDecodeError:
 
         log(
-            "⚠️ Invalid WebSocket JSON"
+            "📡 Subscribed to new Pump.fun tokens"
         )
 
     except Exception as e:
 
         log(
-            f"WebSocket message error: {e}"
+            f"⚠️ Subscription error: {e}"
         )
 
 
-# ============================================================
-# WEBSOCKET ERROR
-# ============================================================
+def on_message(ws, message):
 
-def on_error(
-    ws,
-    error
-):
+    try:
+
+        data = json.loads(message)
+
+    except Exception:
+
+        return
+
+    # PumpPortal sends different message types.
+    # We only care about token creation events.
+
+    tx_type = data.get("txType")
+
+    if tx_type != "create":
+        return
+
+    add_new_token(data)
+
+
+def on_error(ws, error):
 
     log(
         f"⚠️ PumpPortal WebSocket error: "
-        f"{str(error)[:300]}"
+        f"{error}"
     )
 
 
-# ============================================================
-# WEBSOCKET CLOSED
-# ============================================================
-
-def on_close(
-    ws,
-    close_status_code,
-    close_msg
-):
+def on_close(ws, close_status_code, close_msg):
 
     log(
-        f"🔌 PumpPortal connection closed: "
-        f"{close_status_code} "
-        f"{close_msg}"
+        "🔴 PumpPortal disconnected | "
+        f"Code: {close_status_code} | "
+        f"Message: {close_msg}"
     )
 
 
 # ============================================================
-# WEBSOCKET OPEN
+# WEBSOCKET LOOP
 # ============================================================
 
-def on_open(ws):
-
-    log(
-        "🟢 Connected to PumpPortal."
-    )
-
-    subscribe_message = {
-        "method": "subscribeNewToken"
-    }
-
-    ws.send(
-        json.dumps(
-            subscribe_message
-        )
-    )
-
-    log(
-        "📡 Live Pump.fun launch stream subscribed."
-    )
-
-
-# ============================================================
-# WEBSOCKET LISTENER
-# ============================================================
-
-def websocket_listener():
+def websocket_loop():
 
     reconnect_delay = 3
 
@@ -2018,15 +1514,13 @@ def websocket_listener():
 
             ws.run_forever(
                 ping_interval=20,
-                ping_timeout=10,
-                ping_payload="pump-scanner"
+                ping_timeout=10
             )
 
         except Exception as e:
 
             log(
-                f"❌ WebSocket connection error: "
-                f"{e}"
+                f"⚠️ WebSocket exception: {e}"
             )
 
         log(
@@ -2034,9 +1528,7 @@ def websocket_listener():
             f"{reconnect_delay}s..."
         )
 
-        time.sleep(
-            reconnect_delay
-        )
+        time.sleep(reconnect_delay)
 
         reconnect_delay = min(
             reconnect_delay * 2,
@@ -2045,104 +1537,20 @@ def websocket_listener():
 
 
 # ============================================================
-# WATCHDOG
-# ============================================================
-
-def websocket_watchdog():
-
-    global last_event_time
-
-    while True:
-
-        try:
-
-            time.sleep(60)
-
-            silent_for = (
-                time.time()
-                - last_event_time
-            )
-
-            if silent_for > 600:
-
-                log(
-                    "⚠️ No Pump.fun launch event "
-                    "for 10+ minutes."
-                )
-
-        except Exception as e:
-
-            log(
-                f"Watchdog error: {e}"
-            )
-
-
-# ============================================================
 # START WORKERS
 # ============================================================
 
 def start_workers():
 
-    for number in range(
-        WORKER_COUNT
-    ):
+    for i in range(1, WORKER_COUNT + 1):
 
         thread = threading.Thread(
             target=worker,
+            args=(i,),
             daemon=True
         )
 
         thread.start()
-
-    log(
-        f"👷 Started "
-        f"{WORKER_COUNT} controlled workers."
-    )
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-def status_loop():
-
-    while True:
-
-        try:
-
-            time.sleep(60)
-
-            with pending_lock:
-
-                pending_count = len(
-                    pending
-                )
-
-            with seen_lock:
-
-                seen_count = len(
-                    seen
-                )
-
-            with queued_lock:
-
-                queued_count = len(
-                    queued_tokens
-                )
-
-            log(
-                f"📊 STATUS | "
-                f"Pending: {pending_count} | "
-                f"Queued: {queued_count} | "
-                f"Seen/Alerted: {seen_count} | "
-                f"Queue: {token_queue.qsize()}"
-            )
-
-        except Exception as e:
-
-            log(
-                f"Status error: {e}"
-            )
 
 
 # ============================================================
@@ -2151,115 +1559,89 @@ def status_loop():
 
 def main():
 
-    global seen
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        log(
-            "❌ TELEGRAM_BOT_TOKEN is not set."
-        )
-
-        return
-
-    if not TELEGRAM_CHAT_ID:
-
-        log(
-            "❌ TELEGRAM_CHAT_ID is not set."
-        )
-
-        return
-
-    seen = load_seen()
+    log("=" * 60)
+    log("🚀 SOLANA PUMP.FUN TELEGRAM SCANNER")
+    log("=" * 60)
 
     log(
-        "=========================================================="
-    )
-
-    log(
-        "🚀 REAL-TIME PUMP.FUN SCANNER v7"
-    )
-
-    log(
-        "=========================================================="
-    )
-
-    log(
-        "Detection: PumpPortal WebSocket"
-    )
-
-    log(
-        "Mode: subscribeNewToken"
-    )
-
-    log(
-        f"Market Cap: "
+        f"💰 MC range: "
         f"${MIN_MC:,} - ${MAX_MC:,}"
     )
 
     log(
-        f"Minimum Liquidity: "
+        f"💧 Minimum liquidity: "
         f"${MIN_LIQUIDITY:,}"
     )
 
     log(
-        f"Minimum Holders: "
+        f"👥 Minimum holders: "
         f"{MIN_HOLDERS}"
     )
 
     log(
-        f"Monitor window: "
+        f"⏱ Maximum monitoring age: "
         f"{MONITOR_MAX_MINUTES} minutes"
     )
 
     log(
-        f"Dex request gap: "
-        f"{DEX_REQUEST_GAP}s"
+        f"🛡 Dex request spacing: "
+        f"{DEX_MIN_REQUEST_INTERVAL}s"
     )
 
-    log(
-        f"Workers: "
-        f"{WORKER_COUNT}"
-    )
+    if TELEGRAM_BOT_TOKEN:
+        log("✅ Telegram bot token loaded")
+    else:
+        log("❌ Telegram bot token NOT found")
 
-    log(
-        f"Previously alerted: "
-        f"{len(seen)}"
-    )
+    if TELEGRAM_CHAT_ID:
+        log("✅ Telegram chat ID loaded")
+    else:
+        log("❌ Telegram chat ID NOT found")
 
-    log(
-        "=========================================================="
-    )
+    load_seen()
 
+    # Start workers
     start_workers()
 
-    monitor_thread = threading.Thread(
-        target=pending_monitor,
+    # Start scheduler
+    scheduler_thread = threading.Thread(
+        target=scheduler,
         daemon=True
     )
 
-    monitor_thread.start()
+    scheduler_thread.start()
 
-    watchdog_thread = threading.Thread(
-        target=websocket_watchdog,
-        daemon=True
-    )
-
-    watchdog_thread.start()
-
+    # Start status monitor
     status_thread = threading.Thread(
-        target=status_loop,
+        target=status_monitor,
         daemon=True
     )
 
     status_thread.start()
 
-    websocket_listener()
+    log(
+        "📡 Pump.fun detection is LIVE"
+    )
+
+    log(
+        "🛡 DexScreener rate protection is LIVE"
+    )
+
+    log(
+        "📦 Smart queue scheduling is LIVE"
+    )
+
+    log(
+        "🔍 Waiting for new Pump.fun launches..."
+    )
+
+    # Main WebSocket loop
+    websocket_loop()
 
 
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
