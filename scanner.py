@@ -41,13 +41,38 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
+# RISK SETTINGS
+# ============================================================
+
+# TOP 10 CONCENTRATION
+TOP10_GREEN = 30
+TOP10_YELLOW = 45
+
+# LIQUIDITY / MARKET CAP
+LIQ_MC_GREEN = 30
+LIQ_MC_YELLOW = 15
+
+# VOLUME / MARKET CAP
+VOL_MC_GREEN_MAX = 5
+VOL_MC_YELLOW_MAX = 10
+
+# HOLDERS
+HOLDERS_GREEN = 500
+HOLDERS_YELLOW = 100
+
+# TOKEN AGE
+AGE_GREEN = 60
+AGE_YELLOW = 15
+
+
+# ============================================================
 # SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "SolanaTelegramScanner/2.0"
+    "User-Agent": "SolanaTelegramScanner/3.0"
 })
 
 
@@ -78,6 +103,7 @@ def safe_float(value, default=0):
 
             value = value.replace(",", "")
             value = value.replace("$", "")
+            value = value.replace("%", "")
 
         return float(value)
 
@@ -305,7 +331,6 @@ def get_token_authorities(mint):
 
         info = parsed.get("info") or {}
 
-        # Make sure this is a mint account.
         if parsed.get("type") != "mint":
             return result
 
@@ -401,6 +426,12 @@ def get_rugcheck_data(mint):
                     )
                 )
 
+                # Some APIs return percentage
+                # as decimal (0.25 = 25%).
+                # Convert decimal format.
+                if 0 < percentage <= 1:
+                    percentage *= 100
+
                 total_percentage += percentage
 
             if total_percentage > 0:
@@ -460,7 +491,6 @@ def get_rugcheck_data(mint):
 
 def authority_status(authority):
 
-    # None means the authority is revoked.
     if authority is None:
         return "Revoked"
 
@@ -474,7 +504,7 @@ def authority_status(authority):
 # TOKEN AGE
 # ============================================================
 
-def get_token_age(pair):
+def get_age_minutes(pair):
 
     try:
 
@@ -483,10 +513,10 @@ def get_token_age(pair):
         )
 
         if not created:
-            return "Unknown"
+            return None
 
         created_seconds = (
-            created / 1000
+            safe_float(created) / 1000
         )
 
         now = datetime.now(
@@ -498,29 +528,315 @@ def get_token_age(pair):
             now - created_seconds
         )
 
-        minutes = int(
-            age_seconds / 60
-        )
-
-        if minutes < 60:
-            return f"{minutes} min"
-
-        hours = int(
-            minutes / 60
-        )
-
-        if hours < 24:
-            return f"{hours} hr"
-
-        days = int(
-            hours / 24
-        )
-
-        return f"{days} day"
+        return age_seconds / 60
 
     except Exception:
 
+        return None
+
+
+def format_age(pair):
+
+    minutes = get_age_minutes(pair)
+
+    if minutes is None:
         return "Unknown"
+
+    minutes_int = int(minutes)
+
+    if minutes_int < 60:
+        return f"{minutes_int} min"
+
+    hours = int(minutes_int / 60)
+
+    if hours < 24:
+        return f"{hours} hr"
+
+    days = int(hours / 24)
+
+    return f"{days} day"
+
+
+# ============================================================
+# RISK HELPERS
+# ============================================================
+
+def risk_emoji(level):
+
+    if level == "LOW":
+        return "🟢"
+
+    if level == "MEDIUM":
+        return "🟡"
+
+    if level == "HIGH":
+        return "🔴"
+
+    return "⚪"
+
+
+# ------------------------------------------------------------
+# TOP 10 RISK
+# ------------------------------------------------------------
+
+def evaluate_top10(top10):
+
+    if top10 is None:
+        return {
+            "level": "UNKNOWN",
+            "text": "Unknown"
+        }
+
+    if top10 <= TOP10_GREEN:
+        return {
+            "level": "LOW",
+            "text": f"{top10:.1f}%"
+        }
+
+    if top10 <= TOP10_YELLOW:
+        return {
+            "level": "MEDIUM",
+            "text": f"{top10:.1f}%"
+        }
+
+    return {
+        "level": "HIGH",
+        "text": f"{top10:.1f}%"
+    }
+
+
+# ------------------------------------------------------------
+# LIQUIDITY / MC
+# ------------------------------------------------------------
+
+def evaluate_liquidity_mc(liquidity, mc):
+
+    if mc <= 0:
+        return {
+            "level": "UNKNOWN",
+            "text": "Unknown"
+        }
+
+    ratio = (
+        liquidity / mc
+    ) * 100
+
+    if ratio >= LIQ_MC_GREEN:
+        level = "LOW"
+
+    elif ratio >= LIQ_MC_YELLOW:
+        level = "MEDIUM"
+
+    else:
+        level = "HIGH"
+
+    return {
+        "level": level,
+        "text": f"{ratio:.1f}%"
+    }
+
+
+# ------------------------------------------------------------
+# VOLUME / MC
+# ------------------------------------------------------------
+
+def evaluate_volume_mc(volume, mc):
+
+    if mc <= 0:
+        return {
+            "level": "UNKNOWN",
+            "text": "Unknown"
+        }
+
+    ratio = volume / mc
+
+    if ratio <= VOL_MC_GREEN_MAX:
+        level = "LOW"
+
+    elif ratio <= VOL_MC_YELLOW_MAX:
+        level = "MEDIUM"
+
+    else:
+        level = "HIGH"
+
+    return {
+        "level": level,
+        "text": f"{ratio:.1f}x"
+    }
+
+
+# ------------------------------------------------------------
+# HOLDERS
+# ------------------------------------------------------------
+
+def evaluate_holders(holders):
+
+    if holders is None:
+        return {
+            "level": "UNKNOWN",
+            "text": "Unknown"
+        }
+
+    holders_value = safe_float(
+        holders
+    )
+
+    if holders_value >= HOLDERS_GREEN:
+        level = "LOW"
+
+    elif holders_value >= HOLDERS_YELLOW:
+        level = "MEDIUM"
+
+    else:
+        level = "HIGH"
+
+    return {
+        "level": level,
+        "text": format_number(holders_value)
+    }
+
+
+# ------------------------------------------------------------
+# AGE
+# ------------------------------------------------------------
+
+def evaluate_age(age_minutes):
+
+    if age_minutes is None:
+        return {
+            "level": "UNKNOWN",
+            "text": "Unknown"
+        }
+
+    if age_minutes >= AGE_GREEN:
+        level = "LOW"
+
+    elif age_minutes >= AGE_YELLOW:
+        level = "MEDIUM"
+
+    else:
+        level = "HIGH"
+
+    if age_minutes < 60:
+        text = f"{int(age_minutes)} min"
+
+    else:
+        text = f"{int(age_minutes / 60)} hr"
+
+    return {
+        "level": level,
+        "text": text
+    }
+
+
+# ============================================================
+# OVERALL RISK
+# ============================================================
+
+def calculate_overall_risk(flags):
+
+    levels = []
+
+    for flag in flags:
+
+        level = flag.get("level")
+
+        if level in (
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+        ):
+            levels.append(level)
+
+    if not levels:
+        return "UNKNOWN"
+
+    high_count = levels.count("HIGH")
+    medium_count = levels.count("MEDIUM")
+
+    # Any two or more major warning signals
+    # produces HIGH overall risk.
+    if high_count >= 2:
+        return "HIGH"
+
+    if high_count == 1 and medium_count >= 1:
+        return "HIGH"
+
+    if high_count == 1:
+        return "MEDIUM"
+
+    if medium_count >= 2:
+        return "MEDIUM"
+
+    if medium_count == 1:
+        return "MEDIUM"
+
+    return "LOW"
+
+
+# ============================================================
+# BUILD RISK FLAGS
+# ============================================================
+
+def build_risk_flags(
+    mc,
+    liquidity,
+    volume,
+    holders,
+    top10,
+    age_minutes
+):
+
+    top10_result = evaluate_top10(
+        top10
+    )
+
+    liquidity_result = evaluate_liquidity_mc(
+        liquidity,
+        mc
+    )
+
+    volume_result = evaluate_volume_mc(
+        volume,
+        mc
+    )
+
+    holders_result = evaluate_holders(
+        holders
+    )
+
+    age_result = evaluate_age(
+        age_minutes
+    )
+
+    flags = [
+        {
+            "name": "Top 10 concentration",
+            **top10_result
+        },
+        {
+            "name": "Liquidity/MC",
+            **liquidity_result
+        },
+        {
+            "name": "Volume/MC",
+            **volume_result
+        },
+        {
+            "name": "Holders",
+            **holders_result
+        },
+        {
+            "name": "Age",
+            **age_result
+        }
+    ]
+
+    overall = calculate_overall_risk(
+        flags
+    )
+
+    return flags, overall
 
 
 # ============================================================
@@ -684,7 +1000,51 @@ def build_alert(
     # AGE
     # -----------------------------
 
-    age = get_token_age(pair)
+    age_minutes = get_age_minutes(
+        pair
+    )
+
+    age = format_age(pair)
+
+    # -----------------------------
+    # RISK FLAGS
+    # -----------------------------
+
+    flags, overall = build_risk_flags(
+        mc,
+        liquidity,
+        volume,
+        holders,
+        top10,
+        age_minutes
+    )
+
+    # -----------------------------
+    # RISK MESSAGE
+    # -----------------------------
+
+    risk_lines = []
+
+    for flag in flags:
+
+        emoji = risk_emoji(
+            flag["level"]
+        )
+
+        risk_lines.append(
+            f"{emoji} "
+            f"{flag['name']}: "
+            f"{flag['level']} — "
+            f"{flag['text']}"
+        )
+
+    risk_text = "\n".join(
+        risk_lines
+    )
+
+    overall_emoji = risk_emoji(
+        overall
+    )
 
     # -----------------------------
     # LINKS
@@ -723,6 +1083,12 @@ CA:
 🔒 Mint: {mint_status}
 ❄️ Freeze: {freeze_status}
 🐋 Top 10: {top10_text}
+
+🛡️ RISK FLAGS
+
+{risk_text}
+
+{overall_emoji} OVERALL RISK: {overall}
 
 🔗 DexScreener:
 {dex_url}
@@ -837,6 +1203,10 @@ def scan():
         authorities = (
             get_token_authorities(mint)
         )
+
+        # -----------------------------
+        # BUILD ALERT
+        # -----------------------------
 
         message = build_alert(
             pair,
