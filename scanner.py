@@ -1,8 +1,11 @@
 import os
 import time
 import json
-import hashlib
+import threading
+import queue
 import requests
+import websocket
+
 from datetime import datetime, timezone
 
 
@@ -12,45 +15,33 @@ from datetime import datetime, timezone
 
 MIN_MC = 5_000
 MAX_MC = 100_000
+
 MIN_LIQUIDITY = 5_000
+MIN_HOLDERS = 100
 
-SCAN_INTERVAL = 300  # 5 minutes
+# How long a newly launched token can be monitored
+# while waiting for it to reach the filters.
+MONITOR_MAX_MINUTES = 30
 
-REQUEST_TIMEOUT = 30
+# How often pending tokens are checked.
+MONITOR_INTERVAL = 10
+
+REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 RETRY_DELAY = 3
 
-# How many recent Pump.fun transactions to inspect each scan.
-PUMP_SIGNATURE_LIMIT = 100
+# Maximum number of tokens waiting to be checked.
+MAX_PENDING_TOKENS = 500
 
-# Only treat very recent Pump.fun launches as "new".
-MAX_LAUNCH_AGE_MINUTES = 30
+# Number of worker threads processing tokens.
+WORKER_COUNT = 3
 
-
-# ============================================================
-# PUMP.FUN
-# ============================================================
-
-PUMP_FUN_PROGRAM = (
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-)
-
-# Anchor instruction discriminators.
-#
-# create     = sha256("global:create")[:8]
-# create_v2  = sha256("global:create_v2")[:8]
-
-CREATE_DISCRIMINATOR = bytes([
-    24, 30, 200, 40, 5, 28, 7, 119
-])
-
-CREATE_V2_DISCRIMINATOR = bytes([
-    214, 144, 76, 236, 95, 139, 49, 180
-])
+# PumpPortal WebSocket.
+PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
 
 
 # ============================================================
-# RPC / APIs
+# API URLS
 # ============================================================
 
 SOLANA_RPC = (
@@ -75,7 +66,6 @@ TELEGRAM_API = (
 # ============================================================
 
 SEEN_FILE = "seen_tokens.json"
-PUMP_CURSOR_FILE = "pump_cursor.json"
 
 
 # ============================================================
@@ -112,18 +102,35 @@ AGE_YELLOW = 15
 
 
 # ============================================================
-# SESSION
+# HTTP SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "SolanaPumpScanner/5.0"
+    "User-Agent": "SolanaPumpScanner/6.0"
 })
 
 
 # ============================================================
-# LOG
+# GLOBAL STATE
+# ============================================================
+
+seen_lock = threading.Lock()
+
+pending_lock = threading.Lock()
+
+seen = set()
+
+pending = {}
+
+token_queue = queue.Queue(
+    maxsize=MAX_PENDING_TOKENS
+)
+
+
+# ============================================================
+# LOGGING
 # ============================================================
 
 def log(message):
@@ -166,27 +173,37 @@ def format_money(value):
     value = safe_float(value)
 
     if value >= 1_000_000:
+
         return (
             f"${value / 1_000_000:.2f}M"
         )
 
     if value >= 1_000:
-        return f"${value:,.0f}"
 
-    return f"${value:.2f}"
+        return (
+            f"${value:,.0f}"
+        )
+
+    return (
+        f"${value:.2f}"
+    )
 
 
 def format_number(value):
 
     try:
-        return f"{int(float(value)):,}"
+
+        return (
+            f"{int(float(value)):,}"
+        )
 
     except Exception:
+
         return "Unknown"
 
 
 # ============================================================
-# NETWORK RETRY
+# HTTP GET
 # ============================================================
 
 def request_get(url, **kwargs):
@@ -218,7 +235,7 @@ def request_get(url, **kwargs):
             log(
                 f"GET attempt "
                 f"{attempt}/{MAX_RETRIES} failed: "
-                f"{str(e)[:200]}"
+                f"{str(e)[:160]}"
             )
 
             if attempt < MAX_RETRIES:
@@ -227,14 +244,14 @@ def request_get(url, **kwargs):
                     RETRY_DELAY * attempt
                 )
 
-                log(
-                    f"Retrying in {wait}s..."
-                )
-
                 time.sleep(wait)
 
     return None
 
+
+# ============================================================
+# HTTP POST
+# ============================================================
 
 def request_post(url, **kwargs):
 
@@ -265,7 +282,7 @@ def request_post(url, **kwargs):
             log(
                 f"POST attempt "
                 f"{attempt}/{MAX_RETRIES} failed: "
-                f"{str(e)[:200]}"
+                f"{str(e)[:160]}"
             )
 
             if attempt < MAX_RETRIES:
@@ -274,105 +291,9 @@ def request_post(url, **kwargs):
                     RETRY_DELAY * attempt
                 )
 
-                log(
-                    f"Retrying in {wait}s..."
-                )
-
                 time.sleep(wait)
 
     return None
-
-
-# ============================================================
-# BASE58 DECODER
-# ============================================================
-
-BASE58_ALPHABET = (
-    "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-    "abcdefghijkmnopqrstuvwxyz"
-)
-
-
-def base58_decode(value):
-
-    try:
-
-        number = 0
-
-        for character in value:
-
-            number *= 58
-
-            number += BASE58_ALPHABET.index(
-                character
-            )
-
-        result = number.to_bytes(
-            (number.bit_length() + 7) // 8,
-            "big"
-        )
-
-        # Restore leading zero bytes.
-        leading_zeroes = 0
-
-        for character in value:
-
-            if character == "1":
-                leading_zeroes += 1
-            else:
-                break
-
-        return (
-            b"\x00" * leading_zeroes
-            + result
-        )
-
-    except Exception:
-
-        return b""
-
-
-# ============================================================
-# BASE58 ENCODE
-# ============================================================
-
-def base58_encode(data):
-
-    if not data:
-        return ""
-
-    number = int.from_bytes(
-        data,
-        "big"
-    )
-
-    result = ""
-
-    while number > 0:
-
-        number, remainder = divmod(
-            number,
-            58
-        )
-
-        result = (
-            BASE58_ALPHABET[remainder]
-            + result
-        )
-
-    leading_zeroes = 0
-
-    for byte in data:
-
-        if byte == 0:
-            leading_zeroes += 1
-        else:
-            break
-
-    return (
-        "1" * leading_zeroes
-        + result
-    )
 
 
 # ============================================================
@@ -386,6 +307,7 @@ def load_seen():
         if not os.path.exists(
             SEEN_FILE
         ):
+
             return set()
 
         with open(
@@ -396,11 +318,12 @@ def load_seen():
 
             data = json.load(file)
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list
+        ):
 
             return set(data)
-
-        return set()
 
     except Exception as e:
 
@@ -408,12 +331,18 @@ def load_seen():
             f"Could not load seen tokens: {e}"
         )
 
-        return set()
+    return set()
 
 
-def save_seen(seen):
+def save_seen():
 
     try:
+
+        with seen_lock:
+
+            data = sorted(
+                list(seen)
+            )
 
         with open(
             SEEN_FILE,
@@ -422,7 +351,7 @@ def save_seen(seen):
         ) as file:
 
             json.dump(
-                sorted(list(seen)),
+                data,
                 file,
                 indent=2
             )
@@ -435,64 +364,13 @@ def save_seen(seen):
 
 
 # ============================================================
-# PUMP CURSOR
-# ============================================================
-
-def load_pump_cursor():
-
-    try:
-
-        if not os.path.exists(
-            PUMP_CURSOR_FILE
-        ):
-            return None
-
-        with open(
-            PUMP_CURSOR_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        return data.get(
-            "signature"
-        )
-
-    except Exception:
-
-        return None
-
-
-def save_pump_cursor(signature):
-
-    try:
-
-        with open(
-            PUMP_CURSOR_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                {
-                    "signature": signature
-                },
-                file
-            )
-
-    except Exception as e:
-
-        log(
-            f"Could not save Pump cursor: {e}"
-        )
-
-
-# ============================================================
 # SOLANA RPC
 # ============================================================
 
-def rpc_call(method, params):
+def rpc_call(
+    method,
+    params
+):
 
     payload = {
         "jsonrpc": "2.0",
@@ -507,6 +385,7 @@ def rpc_call(method, params):
     )
 
     if not response:
+
         return None
 
     try:
@@ -536,647 +415,12 @@ def rpc_call(method, params):
 
 
 # ============================================================
-# GET PUMP TRANSACTION SIGNATURES
-# ============================================================
-
-def get_pump_signatures():
-
-    cursor = load_pump_cursor()
-
-    config = {
-        "limit": PUMP_SIGNATURE_LIMIT,
-        "commitment": "confirmed"
-    }
-
-    if cursor:
-
-        config["until"] = cursor
-
-    result = rpc_call(
-        "getSignaturesForAddress",
-        [
-            PUMP_FUN_PROGRAM,
-            config
-        ]
-    )
-
-    if not result:
-
-        return []
-
-    return result
-
-
-# ============================================================
-# GET TRANSACTION
-# ============================================================
-
-def get_transaction(signature):
-
-    return rpc_call(
-        "getTransaction",
-        [
-            signature,
-            {
-                "encoding": "json",
-                "commitment": "confirmed",
-                "maxSupportedTransactionVersion": 0
-            }
-        ]
-    )
-
-
-# ============================================================
-# ACCOUNT KEY EXTRACTION
-# ============================================================
-
-def get_all_account_keys(tx):
-
-    transaction = (
-        tx.get("transaction")
-        or {}
-    )
-
-    message = (
-        transaction.get("message")
-        or {}
-    )
-
-    keys = []
-
-    # Normal transaction keys.
-    account_keys = (
-        message.get("accountKeys")
-        or []
-    )
-
-    for key in account_keys:
-
-        if isinstance(
-            key,
-            str
-        ):
-
-            keys.append(key)
-
-        elif isinstance(
-            key,
-            dict
-        ):
-
-            pubkey = key.get(
-                "pubkey"
-            )
-
-            if pubkey:
-                keys.append(pubkey)
-
-    # Versioned transaction loaded addresses.
-    meta = tx.get("meta") or {}
-
-    loaded = (
-        meta.get("loadedAddresses")
-        or {}
-    )
-
-    writable = (
-        loaded.get("writable")
-        or []
-    )
-
-    readonly = (
-        loaded.get("readonly")
-        or []
-    )
-
-    keys.extend(writable)
-    keys.extend(readonly)
-
-    return keys
-
-
-# ============================================================
-# GET ALL INSTRUCTIONS
-# ============================================================
-
-def get_all_instructions(tx):
-
-    transaction = (
-        tx.get("transaction")
-        or {}
-    )
-
-    message = (
-        transaction.get("message")
-        or {}
-    )
-
-    instructions = []
-
-    # Top-level instructions.
-    instructions.extend(
-        message.get(
-            "instructions"
-        )
-        or []
-    )
-
-    # Inner instructions.
-    meta = tx.get("meta") or {}
-
-    inner_groups = (
-        meta.get("innerInstructions")
-        or []
-    )
-
-    for group in inner_groups:
-
-        instructions.extend(
-            group.get(
-                "instructions"
-            )
-            or []
-        )
-
-    return instructions
-
-
-# ============================================================
-# FIND PUMP CREATE INSTRUCTION
-# ============================================================
-
-def extract_pump_mint(tx):
-
-    if not tx:
-
-        return None
-
-    meta = tx.get("meta") or {}
-
-    if meta.get("err") is not None:
-
-        return None
-
-    account_keys = (
-        get_all_account_keys(tx)
-    )
-
-    if not account_keys:
-
-        return None
-
-    instructions = (
-        get_all_instructions(tx)
-    )
-
-    for instruction in instructions:
-
-        if not isinstance(
-            instruction,
-            dict
-        ):
-            continue
-
-        # JSON encoding gives us:
-        #
-        # programIdIndex
-        # accounts
-        # data
-
-        program_index = instruction.get(
-            "programIdIndex"
-        )
-
-        accounts = (
-            instruction.get(
-                "accounts"
-            )
-            or []
-        )
-
-        data = instruction.get(
-            "data"
-        )
-
-        if program_index is None:
-            continue
-
-        if program_index >= len(
-            account_keys
-        ):
-            continue
-
-        program_id = account_keys[
-            program_index
-        ]
-
-        if program_id != PUMP_FUN_PROGRAM:
-            continue
-
-        if not isinstance(
-            data,
-            str
-        ):
-            continue
-
-        raw_data = base58_decode(
-            data
-        )
-
-        if len(raw_data) < 8:
-            continue
-
-        discriminator = raw_data[:8]
-
-        is_create = (
-            discriminator
-            == CREATE_DISCRIMINATOR
-        )
-
-        is_create_v2 = (
-            discriminator
-            == CREATE_V2_DISCRIMINATOR
-        )
-
-        if not (
-            is_create
-            or is_create_v2
-        ):
-            continue
-
-        # Pump.fun IDL:
-        #
-        # create:
-        # account #1 = mint
-        #
-        # create_v2:
-        # account #1 = mint
-
-        if not accounts:
-            continue
-
-        mint_index = accounts[0]
-
-        if mint_index >= len(
-            account_keys
-        ):
-            continue
-
-        mint = account_keys[
-            mint_index
-        ]
-
-        if not mint:
-            continue
-
-        if is_create:
-
-            log(
-                f"🎯 Pump.fun CREATE detected: "
-                f"{mint}"
-            )
-
-        else:
-
-            log(
-                f"🎯 Pump.fun CREATE_V2 detected: "
-                f"{mint}"
-            )
-
-        return mint
-
-    return None
-
-
-# ============================================================
-# DISCOVER NEW PUMP.FUN TOKENS
-# ============================================================
-
-def discover_new_pump_tokens():
-
-    signatures = (
-        get_pump_signatures()
-    )
-
-    if not signatures:
-
-        log(
-            "No Pump.fun signatures returned."
-        )
-
-        return []
-
-    tokens = []
-
-    newest_signature = (
-        signatures[0].get(
-            "signature"
-        )
-    )
-
-    # RPC returns newest -> oldest.
-    #
-    # Process oldest -> newest so alerts
-    # appear in launch order.
-
-    ordered = list(
-        reversed(signatures)
-    )
-
-    now = datetime.now(
-        timezone.utc
-    ).timestamp()
-
-    for item in ordered:
-
-        signature = item.get(
-            "signature"
-        )
-
-        if not signature:
-            continue
-
-        # Ignore failed transactions.
-        if item.get("err") is not None:
-            continue
-
-        block_time = item.get(
-            "blockTime"
-        )
-
-        # Only consider recent launches.
-        if block_time:
-
-            age_minutes = (
-                now - block_time
-            ) / 60
-
-            if (
-                age_minutes
-                > MAX_LAUNCH_AGE_MINUTES
-            ):
-
-                continue
-
-        tx = get_transaction(
-            signature
-        )
-
-        if not tx:
-
-            continue
-
-        mint = extract_pump_mint(
-            tx
-        )
-
-        if not mint:
-
-            continue
-
-        tokens.append({
-            "mint": mint,
-            "signature": signature,
-            "block_time": block_time
-        })
-
-    # The oldest signature is the cursor
-    # boundary for the next scan.
-    #
-    # We save the OLDEST signature we
-    # processed, not the newest.
-
-    oldest_signature = (
-        signatures[-1].get(
-            "signature"
-        )
-    )
-
-    if oldest_signature:
-
-        save_pump_cursor(
-            oldest_signature
-        )
-
-    unique = {}
-
-    for token in tokens:
-
-        unique[
-            token["mint"]
-        ] = token
-
-    return list(
-        unique.values()
-    )
-
-
-# ============================================================
-# DEXSCREENER
-# ============================================================
-
-def get_token_pair(mint):
-
-    response = request_get(
-        DEXSCREENER_TOKEN + mint
-    )
-
-    if not response:
-
-        return None
-
-    try:
-
-        data = response.json()
-
-        pairs = (
-            data.get("pairs")
-            or []
-        )
-
-        solana_pairs = [
-            pair
-            for pair in pairs
-            if pair.get("chainId")
-            == "solana"
-        ]
-
-        if not solana_pairs:
-
-            log(
-                f"⏳ No DexScreener pair yet: "
-                f"{mint}"
-            )
-
-            return None
-
-        solana_pairs.sort(
-            key=lambda p:
-            safe_float(
-                (
-                    p.get("liquidity")
-                    or {}
-                ).get("usd")
-            ),
-            reverse=True
-        )
-
-        return solana_pairs[0]
-
-    except Exception as e:
-
-        log(
-            f"DexScreener JSON error: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# RUGCHECK
-# ============================================================
-
-def get_rugcheck_data(mint):
-
-    result = {
-        "holders": None,
-        "top10": None,
-        "risk": None
-    }
-
-    response = request_get(
-        RUGCHECK_REPORT.format(mint)
-    )
-
-    if not response:
-
-        return result
-
-    try:
-
-        data = response.json()
-
-        # HOLDERS
-        holder_count = (
-            data.get("totalHolders")
-            or data.get("holderCount")
-            or data.get("holdersCount")
-        )
-
-        if holder_count is not None:
-
-            result["holders"] = (
-                holder_count
-            )
-
-        # TOP 10
-        top_holders = data.get(
-            "topHolders"
-        )
-
-        if (
-            isinstance(
-                top_holders,
-                list
-            )
-            and top_holders
-        ):
-
-            total_percentage = 0
-
-            for holder in top_holders[:10]:
-
-                if not isinstance(
-                    holder,
-                    dict
-                ):
-                    continue
-
-                percentage = safe_float(
-                    holder.get("pct")
-                    or holder.get(
-                        "percentage"
-                    )
-                    or holder.get(
-                        "ownershipPercentage"
-                    )
-                )
-
-                # Convert 0.25 -> 25%.
-                if (
-                    0 < percentage <= 1
-                ):
-
-                    percentage *= 100
-
-                total_percentage += (
-                    percentage
-                )
-
-            if total_percentage > 0:
-
-                result["top10"] = (
-                    total_percentage
-                )
-
-        # RISK DATA
-        risks = data.get(
-            "risks"
-        )
-
-        if isinstance(
-            risks,
-            list
-        ):
-
-            names = []
-
-            for risk in risks:
-
-                if not isinstance(
-                    risk,
-                    dict
-                ):
-                    continue
-
-                name = (
-                    risk.get("name")
-                    or risk.get(
-                        "description"
-                    )
-                    or risk.get("level")
-                )
-
-                if name:
-
-                    names.append(
-                        str(name)
-                    )
-
-            if names:
-
-                result["risk"] = (
-                    ", ".join(
-                        names[:5]
-                    )
-                )
-
-        return result
-
-    except Exception as e:
-
-        log(
-            f"RugCheck JSON error: {e}"
-        )
-
-        return result
-
-
-# ============================================================
 # TOKEN AUTHORITIES
 # ============================================================
 
-def get_token_authorities(mint):
+def get_token_authorities(
+    mint
+):
 
     result = {
         "mint_authority": None,
@@ -1260,24 +504,236 @@ def get_token_authorities(mint):
         return result
 
 
-def authority_status(authority):
+def authority_status(
+    authority
+):
 
     if authority is None:
-
         return "Revoked"
 
     if authority == "":
-
         return "Revoked"
 
     return "Active"
 
 
 # ============================================================
+# DEXSCREENER
+# ============================================================
+
+def get_token_pair(
+    mint
+):
+
+    response = request_get(
+        DEXSCREENER_TOKEN + mint
+    )
+
+    if not response:
+
+        return None
+
+    try:
+
+        data = response.json()
+
+        pairs = (
+            data.get("pairs")
+            or []
+        )
+
+        solana_pairs = [
+            pair
+            for pair in pairs
+            if pair.get("chainId")
+            == "solana"
+        ]
+
+        if not solana_pairs:
+
+            return None
+
+        solana_pairs.sort(
+            key=lambda p:
+            safe_float(
+                (
+                    p.get("liquidity")
+                    or {}
+                ).get("usd")
+            ),
+            reverse=True
+        )
+
+        return solana_pairs[0]
+
+    except Exception as e:
+
+        log(
+            f"DexScreener JSON error: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# RUGCHECK
+# ============================================================
+
+def get_rugcheck_data(
+    mint
+):
+
+    result = {
+        "holders": None,
+        "top10": None,
+        "risk": None
+    }
+
+    response = request_get(
+        RUGCHECK_REPORT.format(mint)
+    )
+
+    if not response:
+
+        return result
+
+    try:
+
+        data = response.json()
+
+        # ----------------------------------------------------
+        # HOLDERS
+        # ----------------------------------------------------
+
+        holder_count = (
+            data.get("totalHolders")
+            or data.get("holderCount")
+            or data.get("holdersCount")
+        )
+
+        if holder_count is not None:
+
+            result["holders"] = (
+                holder_count
+            )
+
+        # ----------------------------------------------------
+        # TOP 10
+        # ----------------------------------------------------
+
+        top_holders = data.get(
+            "topHolders"
+        )
+
+        if (
+            isinstance(
+                top_holders,
+                list
+            )
+            and top_holders
+        ):
+
+            total_percentage = 0
+
+            for holder in top_holders[:10]:
+
+                if not isinstance(
+                    holder,
+                    dict
+                ):
+
+                    continue
+
+                percentage = safe_float(
+                    holder.get("pct")
+                    or holder.get(
+                        "percentage"
+                    )
+                    or holder.get(
+                        "ownershipPercentage"
+                    )
+                )
+
+                if (
+                    0 < percentage <= 1
+                ):
+
+                    percentage *= 100
+
+                total_percentage += (
+                    percentage
+                )
+
+            if total_percentage > 0:
+
+                result["top10"] = (
+                    total_percentage
+                )
+
+        # ----------------------------------------------------
+        # RISKS
+        # ----------------------------------------------------
+
+        risks = data.get(
+            "risks"
+        )
+
+        if isinstance(
+            risks,
+            list
+        ):
+
+            names = []
+
+            for risk in risks:
+
+                if not isinstance(
+                    risk,
+                    dict
+                ):
+
+                    continue
+
+                name = (
+                    risk.get("name")
+                    or risk.get(
+                        "description"
+                    )
+                    or risk.get("level")
+                )
+
+                if name:
+
+                    names.append(
+                        str(name)
+                    )
+
+            if names:
+
+                result["risk"] = (
+                    ", ".join(
+                        names[:5]
+                    )
+                )
+
+        return result
+
+    except Exception as e:
+
+        log(
+            f"RugCheck JSON error: {e}"
+        )
+
+        return result
+
+
+# ============================================================
 # AGE
 # ============================================================
 
-def get_age_minutes(pair):
+def get_age_minutes(
+    pair
+):
 
     try:
 
@@ -1311,7 +767,9 @@ def get_age_minutes(pair):
         return None
 
 
-def format_age(age_minutes):
+def format_age(
+    age_minutes
+):
 
     if age_minutes is None:
 
@@ -1342,7 +800,9 @@ def format_age(age_minutes):
 # RISK FLAGS
 # ============================================================
 
-def evaluate_top10(top10):
+def evaluate_top10(
+    top10
+):
 
     if top10 is None:
 
@@ -1434,7 +894,9 @@ def evaluate_volume_mc(
     )
 
 
-def evaluate_holders(holders):
+def evaluate_holders(
+    holders
+):
 
     if holders is None:
 
@@ -1464,7 +926,9 @@ def evaluate_holders(holders):
     )
 
 
-def evaluate_age(age_minutes):
+def evaluate_age(
+    age_minutes
+):
 
     if age_minutes is None:
 
@@ -1514,11 +978,7 @@ def calculate_overall_risk(
 
         return "MEDIUM"
 
-    if medium >= 2:
-
-        return "MEDIUM"
-
-    if medium == 1:
+    if medium >= 1:
 
         return "MEDIUM"
 
@@ -1692,12 +1152,14 @@ def build_risk_flags(
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(
+    message
+):
 
     if not TELEGRAM_BOT_TOKEN:
 
         log(
-            "ERROR: TELEGRAM_BOT_TOKEN missing"
+            "❌ TELEGRAM_BOT_TOKEN missing"
         )
 
         return False
@@ -1705,7 +1167,7 @@ def send_telegram(message):
     if not TELEGRAM_CHAT_ID:
 
         log(
-            "ERROR: TELEGRAM_CHAT_ID missing"
+            "❌ TELEGRAM_CHAT_ID missing"
         )
 
         return False
@@ -1798,29 +1260,21 @@ def build_alert(
         "holders"
     )
 
-    if holders is None:
-
-        holders_text = "Unknown"
-
-    else:
-
-        holders_text = format_number(
-            holders
-        )
+    holders_text = (
+        format_number(holders)
+        if holders is not None
+        else "Unknown"
+    )
 
     top10 = security.get(
         "top10"
     )
 
-    if top10 is None:
-
-        top10_text = "Unknown"
-
-    else:
-
-        top10_text = (
-            f"{top10:.1f}%"
-        )
+    top10_text = (
+        f"{top10:.1f}%"
+        if top10 is not None
+        else "Unknown"
+    )
 
     if authorities.get(
         "success"
@@ -1927,53 +1381,32 @@ CA:
 
 
 # ============================================================
-# PROCESS TOKEN
+# CHECK TOKEN
 # ============================================================
 
-def process_token(
+def check_token(
     mint,
-    seen
+    launch_data
 ):
 
-    if mint in seen:
+    with seen_lock:
 
-        return False
+        if mint in seen:
 
-    # Give DexScreener time to index
-    # a brand-new Pump.fun token.
+            return
 
-    pair = None
-
-    for attempt in range(
-        1,
-        4
-    ):
-
-        pair = get_token_pair(
-            mint
-        )
-
-        if pair:
-
-            break
-
-        log(
-            f"Waiting for DexScreener "
-            f"indexing "
-            f"({attempt}/3): "
-            f"{mint}"
-        )
-
-        time.sleep(5)
+    pair = get_token_pair(
+        mint
+    )
 
     if not pair:
 
         log(
-            f"Skipped — no DexScreener "
-            f"pair yet: {mint}"
+            f"⏳ Waiting for DexScreener: "
+            f"{mint}"
         )
 
-        return False
+        return
 
     mc = safe_float(
         pair.get("marketCap")
@@ -1987,57 +1420,133 @@ def process_token(
         ).get("usd")
     )
 
-    # MARKET CAP
-    if mc < MIN_MC:
+    age_minutes = get_age_minutes(
+        pair
+    )
 
-        log(
-            f"Filtered MC below "
-            f"${MIN_MC:,}: "
-            f"{mint} | "
-            f"{format_money(mc)}"
-        )
+    # --------------------------------------------------------
+    # TOO OLD
+    # --------------------------------------------------------
 
-        return False
+    if age_minutes is not None:
+
+        if (
+            age_minutes
+            > MONITOR_MAX_MINUTES
+        ):
+
+            log(
+                f"⌛ Token expired from monitoring: "
+                f"{mint}"
+            )
+
+            with pending_lock:
+
+                pending.pop(
+                    mint,
+                    None
+                )
+
+            return
+
+    # --------------------------------------------------------
+    # ABOVE MAX MC
+    # --------------------------------------------------------
 
     if mc > MAX_MC:
 
         log(
-            f"Filtered MC above "
+            f"⬆️ MC already above "
             f"${MAX_MC:,}: "
             f"{mint} | "
             f"{format_money(mc)}"
         )
 
-        return False
+        with pending_lock:
 
+            pending.pop(
+                mint,
+                None
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # BELOW MIN MC
+    # --------------------------------------------------------
+
+    if mc < MIN_MC:
+
+        log(
+            f"⏳ MC below ${MIN_MC:,}: "
+            f"{mint} | "
+            f"{format_money(mc)}"
+        )
+
+        return
+
+    # --------------------------------------------------------
     # LIQUIDITY
+    # --------------------------------------------------------
+
     if liquidity < MIN_LIQUIDITY:
 
         log(
-            f"Filtered liquidity: "
+            f"💧 Liquidity below "
+            f"${MIN_LIQUIDITY:,}: "
             f"{mint} | "
             f"{format_money(liquidity)}"
         )
 
-        return False
+        return
 
-    log(
-        f"🔥 QUALIFIED PUMP.FUN TOKEN: "
-        f"{mint} | "
-        f"MC={format_money(mc)} | "
-        f"Liquidity="
-        f"{format_money(liquidity)}"
-    )
+    # --------------------------------------------------------
+    # SECURITY DATA
+    # --------------------------------------------------------
 
-    # SECURITY
     security = get_rugcheck_data(
         mint
     )
+
+    holders = security.get(
+        "holders"
+    )
+
+    if (
+        holders is None
+        or safe_float(holders)
+        < MIN_HOLDERS
+    ):
+
+        log(
+            f"👥 Holders below "
+            f"{MIN_HOLDERS}: "
+            f"{mint} | "
+            f"{holders if holders is not None else 'Unknown'}"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # AUTHORITIES
+    # --------------------------------------------------------
 
     authorities = (
         get_token_authorities(
             mint
         )
+    )
+
+    # --------------------------------------------------------
+    # QUALIFIED
+    # --------------------------------------------------------
+
+    log(
+        f"🔥 QUALIFIED TOKEN: "
+        f"{mint} | "
+        f"MC={format_money(mc)} | "
+        f"Liquidity={format_money(liquidity)} | "
+        f"Holders={format_number(holders)}"
     )
 
     message = build_alert(
@@ -2047,119 +1556,517 @@ def process_token(
         authorities
     )
 
-    # TELEGRAM
-    if send_telegram(message):
+    if send_telegram(
+        message
+    ):
 
         log(
             f"✅ Telegram alert sent: "
             f"{mint}"
         )
 
-        # Only mark as seen after
-        # successful Telegram delivery.
+        with seen_lock:
 
-        seen.add(mint)
+            seen.add(
+                mint
+            )
 
-        save_seen(seen)
+        save_seen()
 
-        return True
+        with pending_lock:
 
-    log(
-        f"❌ Telegram failed: "
-        f"{mint}"
-    )
+            pending.pop(
+                mint,
+                None
+            )
 
-    return False
+    else:
 
-
-# ============================================================
-# SCAN
-# ============================================================
-
-def scan():
-
-    seen = load_seen()
-
-    log("=" * 70)
-
-    log(
-        "🚀 PUMP.FUN DIRECT SCANNER"
-    )
-
-    log(
-        "Detection: ON-CHAIN "
-        "CREATE + CREATE_V2"
-    )
-
-    log(
-        f"Market Cap: "
-        f"${MIN_MC:,} - "
-        f"${MAX_MC:,}"
-    )
-
-    log(
-        f"Minimum Liquidity: "
-        f"${MIN_LIQUIDITY:,}"
-    )
-
-    log(
-        f"Previously alerted: "
-        f"{len(seen)}"
-    )
-
-    tokens = (
-        discover_new_pump_tokens()
-    )
-
-    log(
-        f"New Pump.fun launches detected: "
-        f"{len(tokens)}"
-    )
-
-    checked = 0
-    alerts = 0
-
-    for token in tokens:
-
-        mint = token.get(
-            "mint"
+        log(
+            f"❌ Telegram failed: "
+            f"{mint}"
         )
 
-        if not mint:
 
-            continue
+# ============================================================
+# WORKER
+# ============================================================
 
-        checked += 1
+def worker():
+
+    while True:
 
         try:
 
-            if process_token(
-                mint,
-                seen
-            ):
+            item = token_queue.get()
 
-                alerts += 1
+            if item is None:
+
+                token_queue.task_done()
+
+                continue
+
+            mint = item.get(
+                "mint"
+            )
+
+            launch_data = item.get(
+                "launch_data"
+            )
+
+            try:
+
+                check_token(
+                    mint,
+                    launch_data
+                )
+
+            except Exception as e:
+
+                log(
+                    f"Worker error for "
+                    f"{mint}: {e}"
+                )
+
+            finally:
+
+                token_queue.task_done()
 
         except Exception as e:
 
             log(
-                f"Processing error "
-                f"for {mint}: {e}"
+                f"Worker loop error: {e}"
             )
 
-    save_seen(seen)
+            time.sleep(2)
 
-    log("=" * 70)
 
-    log(
-        f"SCAN COMPLETE | "
-        f"Pump launches checked: "
-        f"{checked} | "
-        f"New alerts: {alerts} | "
-        f"Seen: {len(seen)}"
+# ============================================================
+# PENDING MONITOR
+# ============================================================
+
+def pending_monitor():
+
+    while True:
+
+        try:
+
+            time.sleep(
+                MONITOR_INTERVAL
+            )
+
+            now = time.time()
+
+            with pending_lock:
+
+                items = list(
+                    pending.items()
+                )
+
+            for mint, data in items:
+
+                first_seen = data.get(
+                    "first_seen",
+                    now
+                )
+
+                age_seconds = (
+                    now - first_seen
+                )
+
+                if age_seconds > (
+                    MONITOR_MAX_MINUTES
+                    * 60
+                ):
+
+                    with pending_lock:
+
+                        pending.pop(
+                            mint,
+                            None
+                        )
+
+                    log(
+                        f"⌛ Monitoring expired: "
+                        f"{mint}"
+                    )
+
+                    continue
+
+                try:
+
+                    token_queue.put_nowait({
+                        "mint": mint,
+                        "launch_data": data.get(
+                            "launch_data"
+                        )
+                    })
+
+                except queue.Full:
+
+                    log(
+                        "⚠️ Token queue full."
+                    )
+
+        except Exception as e:
+
+            log(
+                f"Pending monitor error: {e}"
+            )
+
+            time.sleep(3)
+
+
+# ============================================================
+# ADD NEW TOKEN
+# ============================================================
+
+def add_new_token(
+    event
+):
+
+    mint = event.get(
+        "mint"
     )
 
-    log("=" * 70)
+    if not mint:
+
+        return
+
+    with seen_lock:
+
+        if mint in seen:
+
+            return
+
+    with pending_lock:
+
+        if mint in pending:
+
+            return
+
+        pending[mint] = {
+            "first_seen": time.time(),
+            "launch_data": event
+        }
+
+    name = (
+        event.get("name")
+        or "Unknown"
+    )
+
+    symbol = (
+        event.get("symbol")
+        or "UNKNOWN"
+    )
+
+    log(
+        "🟢 NEW PUMP.FUN LAUNCH"
+    )
+
+    log(
+        f"   Name: {name} ({symbol})"
+    )
+
+    log(
+        f"   CA: {mint}"
+    )
+
+    log(
+        f"   Dev: "
+        f"{event.get('traderPublicKey', 'Unknown')}"
+    )
+
+    log(
+        f"   Pump MC SOL: "
+        f"{event.get('marketCapSol', 'Unknown')}"
+    )
+
+    try:
+
+        token_queue.put_nowait({
+            "mint": mint,
+            "launch_data": event
+        })
+
+    except queue.Full:
+
+        log(
+            f"⚠️ Queue full; token waiting "
+            f"in pending monitor: {mint}"
+        )
+
+
+# ============================================================
+# WEBSOCKET MESSAGE
+# ============================================================
+
+last_event_time = time.time()
+
+
+def on_message(
+    ws,
+    message
+):
+
+    global last_event_time
+
+    last_event_time = time.time()
+
+    try:
+
+        if not message:
+
+            return
+
+        data = json.loads(
+            message
+        )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            return
+
+        tx_type = data.get(
+            "txType"
+        )
+
+        if tx_type != "create":
+
+            return
+
+        add_new_token(
+            data
+        )
+
+    except json.JSONDecodeError:
+
+        log(
+            f"⚠️ Invalid WebSocket JSON: "
+            f"{str(message)[:200]}"
+        )
+
+    except Exception as e:
+
+        log(
+            f"WebSocket message error: {e}"
+        )
+
+
+# ============================================================
+# WEBSOCKET ERROR
+# ============================================================
+
+def on_error(
+    ws,
+    error
+):
+
+    log(
+        f"⚠️ PumpPortal WebSocket error: "
+        f"{str(error)[:300]}"
+    )
+
+
+# ============================================================
+# WEBSOCKET CLOSED
+# ============================================================
+
+def on_close(
+    ws,
+    close_status_code,
+    close_msg
+):
+
+    log(
+        f"🔌 PumpPortal connection closed: "
+        f"{close_status_code} "
+        f"{close_msg}"
+    )
+
+
+# ============================================================
+# WEBSOCKET OPEN
+# ============================================================
+
+def on_open(
+    ws
+):
+
+    log(
+        "🟢 Connected to PumpPortal."
+    )
+
+    subscribe_message = {
+        "method": "subscribeNewToken"
+    }
+
+    ws.send(
+        json.dumps(
+            subscribe_message
+        )
+    )
+
+    log(
+        "📡 Live Pump.fun launch stream subscribed."
+    )
+
+
+# ============================================================
+# WEBSOCKET LISTENER
+# ============================================================
+
+def websocket_listener():
+
+    reconnect_delay = 3
+
+    while True:
+
+        try:
+
+            log(
+                "🔌 Connecting to PumpPortal..."
+            )
+
+            ws = websocket.WebSocketApp(
+                PUMPPORTAL_WS,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                ping_payload="pump-scanner"
+            )
+
+        except Exception as e:
+
+            log(
+                f"❌ WebSocket connection error: "
+                f"{e}"
+            )
+
+        log(
+            f"🔄 Reconnecting in "
+            f"{reconnect_delay}s..."
+        )
+
+        time.sleep(
+            reconnect_delay
+        )
+
+        reconnect_delay = min(
+            reconnect_delay * 2,
+            60
+        )
+
+
+# ============================================================
+# WATCHDOG
+# ============================================================
+
+def websocket_watchdog():
+
+    global last_event_time
+
+    while True:
+
+        try:
+
+            time.sleep(60)
+
+            silent_for = (
+                time.time()
+                - last_event_time
+            )
+
+            # If there have been no launch
+            # events for a long period,
+            # the listener thread will be
+            # allowed to reconnect naturally.
+            #
+            # This is only a warning because
+            # a quiet market is possible.
+
+            if silent_for > 600:
+
+                log(
+                    "⚠️ No Pump.fun launch event "
+                    "received for 10+ minutes."
+                )
+
+        except Exception as e:
+
+            log(
+                f"Watchdog error: {e}"
+            )
+
+
+# ============================================================
+# START WORKERS
+# ============================================================
+
+def start_workers():
+
+    for number in range(
+        WORKER_COUNT
+    ):
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True
+        )
+
+        thread.start()
+
+    log(
+        f"👷 Started "
+        f"{WORKER_COUNT} token workers."
+    )
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+def status_loop():
+
+    while True:
+
+        try:
+
+            time.sleep(60)
+
+            with pending_lock:
+
+                pending_count = len(
+                    pending
+                )
+
+            with seen_lock:
+
+                seen_count = len(
+                    seen
+                )
+
+            log(
+                f"📊 STATUS | "
+                f"Pending: {pending_count} | "
+                f"Seen/Alerted: {seen_count} | "
+                f"Queue: {token_queue.qsize()}"
+            )
+
+        except Exception as e:
+
+            log(
+                f"Status error: {e}"
+            )
 
 
 # ============================================================
@@ -2168,11 +2075,12 @@ def scan():
 
 def main():
 
+    global seen
+
     if not TELEGRAM_BOT_TOKEN:
 
         log(
-            "❌ TELEGRAM_BOT_TOKEN "
-            "is not set."
+            "❌ TELEGRAM_BOT_TOKEN is not set."
         )
 
         return
@@ -2180,51 +2088,90 @@ def main():
     if not TELEGRAM_CHAT_ID:
 
         log(
-            "❌ TELEGRAM_CHAT_ID "
-            "is not set."
+            "❌ TELEGRAM_CHAT_ID is not set."
         )
 
         return
 
+    seen = load_seen()
+
     log(
-        "Telegram credentials detected."
+        "=========================================================="
     )
 
     log(
-        "✅ Direct Pump.fun scanner ready."
+        "🚀 REAL-TIME PUMP.FUN SCANNER"
     )
 
     log(
-        "Works with GitHub Actions "
-        "and Termux."
+        "=========================================================="
     )
 
     log(
-        f"Scanning every "
-        f"{SCAN_INTERVAL // 60} minutes."
+        "Detection: PumpPortal WebSocket"
     )
 
-    while True:
+    log(
+        "Mode: subscribeNewToken"
+    )
 
-        try:
+    log(
+        f"Market Cap: "
+        f"${MIN_MC:,} - ${MAX_MC:,}"
+    )
 
-            scan()
+    log(
+        f"Minimum Liquidity: "
+        f"${MIN_LIQUIDITY:,}"
+    )
 
-        except Exception as e:
+    log(
+        f"Minimum Holders: "
+        f"{MIN_HOLDERS}"
+    )
 
-            log(
-                f"Unexpected scanner error: "
-                f"{e}"
-            )
+    log(
+        f"Monitor window: "
+        f"{MONITOR_MAX_MINUTES} minutes"
+    )
 
-        log(
-            f"Sleeping for "
-            f"{SCAN_INTERVAL} seconds..."
-        )
+    log(
+        "Polling delay: NONE"
+    )
 
-        time.sleep(
-            SCAN_INTERVAL
-        )
+    log(
+        f"Previously alerted: "
+        f"{len(seen)}"
+    )
+
+    log(
+        "=========================================================="
+    )
+
+    start_workers()
+
+    monitor_thread = threading.Thread(
+        target=pending_monitor,
+        daemon=True
+    )
+
+    monitor_thread.start()
+
+    watchdog_thread = threading.Thread(
+        target=websocket_watchdog,
+        daemon=True
+    )
+
+    watchdog_thread.start()
+
+    status_thread = threading.Thread(
+        target=status_loop,
+        daemon=True
+    )
+
+    status_thread.start()
+
+    websocket_listener()
 
 
 # ============================================================
