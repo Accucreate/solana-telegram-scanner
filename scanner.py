@@ -1,8 +1,10 @@
 import os
 import time
 import json
+import hashlib
 import requests
 from datetime import datetime, timezone
+
 
 # ============================================================
 # SETTINGS
@@ -14,8 +16,45 @@ MIN_LIQUIDITY = 5_000
 
 SCAN_INTERVAL = 300  # 5 minutes
 
-DEXSCREENER_PROFILES = (
-    "https://api.dexscreener.com/token-profiles/latest/v1"
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+RETRY_DELAY = 3
+
+# How many recent Pump.fun transactions to inspect each scan.
+PUMP_SIGNATURE_LIMIT = 100
+
+# Only treat very recent Pump.fun launches as "new".
+MAX_LAUNCH_AGE_MINUTES = 30
+
+
+# ============================================================
+# PUMP.FUN
+# ============================================================
+
+PUMP_FUN_PROGRAM = (
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+)
+
+# Anchor instruction discriminators.
+#
+# create     = sha256("global:create")[:8]
+# create_v2  = sha256("global:create_v2")[:8]
+
+CREATE_DISCRIMINATOR = bytes([
+    24, 30, 200, 40, 5, 28, 7, 119
+])
+
+CREATE_V2_DISCRIMINATOR = bytes([
+    214, 144, 76, 236, 95, 139, 49, 180
+])
+
+
+# ============================================================
+# RPC / APIs
+# ============================================================
+
+SOLANA_RPC = (
+    "https://api.mainnet-beta.solana.com"
 )
 
 DEXSCREENER_TOKEN = (
@@ -26,41 +65,48 @@ RUGCHECK_REPORT = (
     "https://api.rugcheck.xyz/v1/tokens/{}/report"
 )
 
-SOLANA_RPC = (
-    "https://api.mainnet-beta.solana.com"
-)
-
 TELEGRAM_API = (
     "https://api.telegram.org/bot{}/sendMessage"
 )
 
-SEEN_FILE = "seen_tokens.json"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ============================================================
+# LOCAL FILES
+# ============================================================
+
+SEEN_FILE = "seen_tokens.json"
+PUMP_CURSOR_FILE = "pump_cursor.json"
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID"
+)
 
 
 # ============================================================
 # RISK SETTINGS
 # ============================================================
 
-# TOP 10 CONCENTRATION
 TOP10_GREEN = 30
 TOP10_YELLOW = 45
 
-# LIQUIDITY / MARKET CAP
 LIQ_MC_GREEN = 30
 LIQ_MC_YELLOW = 15
 
-# VOLUME / MARKET CAP
 VOL_MC_GREEN_MAX = 5
 VOL_MC_YELLOW_MAX = 10
 
-# HOLDERS
 HOLDERS_GREEN = 500
 HOLDERS_YELLOW = 100
 
-# TOKEN AGE
 AGE_GREEN = 60
 AGE_YELLOW = 15
 
@@ -72,12 +118,12 @@ AGE_YELLOW = 15
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "SolanaTelegramScanner/3.0"
+    "User-Agent": "SolanaPumpScanner/5.0"
 })
 
 
 # ============================================================
-# BASIC HELPERS
+# LOG
 # ============================================================
 
 def log(message):
@@ -92,6 +138,10 @@ def log(message):
     )
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def safe_float(value, default=0):
 
     try:
@@ -103,7 +153,6 @@ def safe_float(value, default=0):
 
             value = value.replace(",", "")
             value = value.replace("$", "")
-            value = value.replace("%", "")
 
         return float(value)
 
@@ -117,7 +166,9 @@ def format_money(value):
     value = safe_float(value)
 
     if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
+        return (
+            f"${value / 1_000_000:.2f}M"
+        )
 
     if value >= 1_000:
         return f"${value:,.0f}"
@@ -128,10 +179,200 @@ def format_money(value):
 def format_number(value):
 
     try:
-        return f"{int(value):,}"
+        return f"{int(float(value)):,}"
 
     except Exception:
         return "Unknown"
+
+
+# ============================================================
+# NETWORK RETRY
+# ============================================================
+
+def request_get(url, **kwargs):
+
+    timeout = kwargs.pop(
+        "timeout",
+        REQUEST_TIMEOUT
+    )
+
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1
+    ):
+
+        try:
+
+            response = session.get(
+                url,
+                timeout=timeout,
+                **kwargs
+            )
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException as e:
+
+            log(
+                f"GET attempt "
+                f"{attempt}/{MAX_RETRIES} failed: "
+                f"{str(e)[:200]}"
+            )
+
+            if attempt < MAX_RETRIES:
+
+                wait = (
+                    RETRY_DELAY * attempt
+                )
+
+                log(
+                    f"Retrying in {wait}s..."
+                )
+
+                time.sleep(wait)
+
+    return None
+
+
+def request_post(url, **kwargs):
+
+    timeout = kwargs.pop(
+        "timeout",
+        REQUEST_TIMEOUT
+    )
+
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1
+    ):
+
+        try:
+
+            response = session.post(
+                url,
+                timeout=timeout,
+                **kwargs
+            )
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException as e:
+
+            log(
+                f"POST attempt "
+                f"{attempt}/{MAX_RETRIES} failed: "
+                f"{str(e)[:200]}"
+            )
+
+            if attempt < MAX_RETRIES:
+
+                wait = (
+                    RETRY_DELAY * attempt
+                )
+
+                log(
+                    f"Retrying in {wait}s..."
+                )
+
+                time.sleep(wait)
+
+    return None
+
+
+# ============================================================
+# BASE58 DECODER
+# ============================================================
+
+BASE58_ALPHABET = (
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    "abcdefghijkmnopqrstuvwxyz"
+)
+
+
+def base58_decode(value):
+
+    try:
+
+        number = 0
+
+        for character in value:
+
+            number *= 58
+
+            number += BASE58_ALPHABET.index(
+                character
+            )
+
+        result = number.to_bytes(
+            (number.bit_length() + 7) // 8,
+            "big"
+        )
+
+        # Restore leading zero bytes.
+        leading_zeroes = 0
+
+        for character in value:
+
+            if character == "1":
+                leading_zeroes += 1
+            else:
+                break
+
+        return (
+            b"\x00" * leading_zeroes
+            + result
+        )
+
+    except Exception:
+
+        return b""
+
+
+# ============================================================
+# BASE58 ENCODE
+# ============================================================
+
+def base58_encode(data):
+
+    if not data:
+        return ""
+
+    number = int.from_bytes(
+        data,
+        "big"
+    )
+
+    result = ""
+
+    while number > 0:
+
+        number, remainder = divmod(
+            number,
+            58
+        )
+
+        result = (
+            BASE58_ALPHABET[remainder]
+            + result
+        )
+
+    leading_zeroes = 0
+
+    for byte in data:
+
+        if byte == 0:
+            leading_zeroes += 1
+        else:
+            break
+
+    return (
+        "1" * leading_zeroes
+        + result
+    )
 
 
 # ============================================================
@@ -142,7 +383,9 @@ def load_seen():
 
     try:
 
-        if not os.path.exists(SEEN_FILE):
+        if not os.path.exists(
+            SEEN_FILE
+        ):
             return set()
 
         with open(
@@ -154,6 +397,7 @@ def load_seen():
             data = json.load(file)
 
         if isinstance(data, list):
+
             return set(data)
 
         return set()
@@ -191,79 +435,588 @@ def save_seen(seen):
 
 
 # ============================================================
-# DEXSCREENER
+# PUMP CURSOR
 # ============================================================
 
-def get_latest_solana_tokens():
+def load_pump_cursor():
 
     try:
 
-        response = session.get(
-            DEXSCREENER_PROFILES,
-            timeout=20
+        if not os.path.exists(
+            PUMP_CURSOR_FILE
+        ):
+            return None
+
+        with open(
+            PUMP_CURSOR_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+        return data.get(
+            "signature"
         )
 
-        response.raise_for_status()
+    except Exception:
+
+        return None
+
+
+def save_pump_cursor(signature):
+
+    try:
+
+        with open(
+            PUMP_CURSOR_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                {
+                    "signature": signature
+                },
+                file
+            )
+
+    except Exception as e:
+
+        log(
+            f"Could not save Pump cursor: {e}"
+        )
+
+
+# ============================================================
+# SOLANA RPC
+# ============================================================
+
+def rpc_call(method, params):
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    }
+
+    response = request_post(
+        SOLANA_RPC,
+        json=payload
+    )
+
+    if not response:
+        return None
+
+    try:
 
         data = response.json()
 
-        addresses = []
+        if data.get("error"):
 
-        if isinstance(data, list):
+            log(
+                f"RPC error: "
+                f"{data['error']}"
+            )
 
-            for item in data:
+            return None
 
-                if item.get("chainId") != "solana":
-                    continue
-
-                address = (
-                    item.get("tokenAddress")
-                    or item.get("address")
-                )
-
-                if address:
-                    addresses.append(address)
-
-        return list(
-            dict.fromkeys(addresses)
+        return data.get(
+            "result"
         )
 
     except Exception as e:
 
         log(
-            f"DexScreener discovery error: {e}"
+            f"RPC JSON error: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# GET PUMP TRANSACTION SIGNATURES
+# ============================================================
+
+def get_pump_signatures():
+
+    cursor = load_pump_cursor()
+
+    config = {
+        "limit": PUMP_SIGNATURE_LIMIT,
+        "commitment": "confirmed"
+    }
+
+    if cursor:
+
+        config["until"] = cursor
+
+    result = rpc_call(
+        "getSignaturesForAddress",
+        [
+            PUMP_FUN_PROGRAM,
+            config
+        ]
+    )
+
+    if not result:
+
+        return []
+
+    return result
+
+
+# ============================================================
+# GET TRANSACTION
+# ============================================================
+
+def get_transaction(signature):
+
+    return rpc_call(
+        "getTransaction",
+        [
+            signature,
+            {
+                "encoding": "json",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0
+            }
+        ]
+    )
+
+
+# ============================================================
+# ACCOUNT KEY EXTRACTION
+# ============================================================
+
+def get_all_account_keys(tx):
+
+    transaction = (
+        tx.get("transaction")
+        or {}
+    )
+
+    message = (
+        transaction.get("message")
+        or {}
+    )
+
+    keys = []
+
+    # Normal transaction keys.
+    account_keys = (
+        message.get("accountKeys")
+        or []
+    )
+
+    for key in account_keys:
+
+        if isinstance(
+            key,
+            str
+        ):
+
+            keys.append(key)
+
+        elif isinstance(
+            key,
+            dict
+        ):
+
+            pubkey = key.get(
+                "pubkey"
+            )
+
+            if pubkey:
+                keys.append(pubkey)
+
+    # Versioned transaction loaded addresses.
+    meta = tx.get("meta") or {}
+
+    loaded = (
+        meta.get("loadedAddresses")
+        or {}
+    )
+
+    writable = (
+        loaded.get("writable")
+        or []
+    )
+
+    readonly = (
+        loaded.get("readonly")
+        or []
+    )
+
+    keys.extend(writable)
+    keys.extend(readonly)
+
+    return keys
+
+
+# ============================================================
+# GET ALL INSTRUCTIONS
+# ============================================================
+
+def get_all_instructions(tx):
+
+    transaction = (
+        tx.get("transaction")
+        or {}
+    )
+
+    message = (
+        transaction.get("message")
+        or {}
+    )
+
+    instructions = []
+
+    # Top-level instructions.
+    instructions.extend(
+        message.get(
+            "instructions"
+        )
+        or []
+    )
+
+    # Inner instructions.
+    meta = tx.get("meta") or {}
+
+    inner_groups = (
+        meta.get("innerInstructions")
+        or []
+    )
+
+    for group in inner_groups:
+
+        instructions.extend(
+            group.get(
+                "instructions"
+            )
+            or []
+        )
+
+    return instructions
+
+
+# ============================================================
+# FIND PUMP CREATE INSTRUCTION
+# ============================================================
+
+def extract_pump_mint(tx):
+
+    if not tx:
+
+        return None
+
+    meta = tx.get("meta") or {}
+
+    if meta.get("err") is not None:
+
+        return None
+
+    account_keys = (
+        get_all_account_keys(tx)
+    )
+
+    if not account_keys:
+
+        return None
+
+    instructions = (
+        get_all_instructions(tx)
+    )
+
+    for instruction in instructions:
+
+        if not isinstance(
+            instruction,
+            dict
+        ):
+            continue
+
+        # JSON encoding gives us:
+        #
+        # programIdIndex
+        # accounts
+        # data
+
+        program_index = instruction.get(
+            "programIdIndex"
+        )
+
+        accounts = (
+            instruction.get(
+                "accounts"
+            )
+            or []
+        )
+
+        data = instruction.get(
+            "data"
+        )
+
+        if program_index is None:
+            continue
+
+        if program_index >= len(
+            account_keys
+        ):
+            continue
+
+        program_id = account_keys[
+            program_index
+        ]
+
+        if program_id != PUMP_FUN_PROGRAM:
+            continue
+
+        if not isinstance(
+            data,
+            str
+        ):
+            continue
+
+        raw_data = base58_decode(
+            data
+        )
+
+        if len(raw_data) < 8:
+            continue
+
+        discriminator = raw_data[:8]
+
+        is_create = (
+            discriminator
+            == CREATE_DISCRIMINATOR
+        )
+
+        is_create_v2 = (
+            discriminator
+            == CREATE_V2_DISCRIMINATOR
+        )
+
+        if not (
+            is_create
+            or is_create_v2
+        ):
+            continue
+
+        # Pump.fun IDL:
+        #
+        # create:
+        # account #1 = mint
+        #
+        # create_v2:
+        # account #1 = mint
+
+        if not accounts:
+            continue
+
+        mint_index = accounts[0]
+
+        if mint_index >= len(
+            account_keys
+        ):
+            continue
+
+        mint = account_keys[
+            mint_index
+        ]
+
+        if not mint:
+            continue
+
+        if is_create:
+
+            log(
+                f"🎯 Pump.fun CREATE detected: "
+                f"{mint}"
+            )
+
+        else:
+
+            log(
+                f"🎯 Pump.fun CREATE_V2 detected: "
+                f"{mint}"
+            )
+
+        return mint
+
+    return None
+
+
+# ============================================================
+# DISCOVER NEW PUMP.FUN TOKENS
+# ============================================================
+
+def discover_new_pump_tokens():
+
+    signatures = (
+        get_pump_signatures()
+    )
+
+    if not signatures:
+
+        log(
+            "No Pump.fun signatures returned."
         )
 
         return []
 
+    tokens = []
+
+    newest_signature = (
+        signatures[0].get(
+            "signature"
+        )
+    )
+
+    # RPC returns newest -> oldest.
+    #
+    # Process oldest -> newest so alerts
+    # appear in launch order.
+
+    ordered = list(
+        reversed(signatures)
+    )
+
+    now = datetime.now(
+        timezone.utc
+    ).timestamp()
+
+    for item in ordered:
+
+        signature = item.get(
+            "signature"
+        )
+
+        if not signature:
+            continue
+
+        # Ignore failed transactions.
+        if item.get("err") is not None:
+            continue
+
+        block_time = item.get(
+            "blockTime"
+        )
+
+        # Only consider recent launches.
+        if block_time:
+
+            age_minutes = (
+                now - block_time
+            ) / 60
+
+            if (
+                age_minutes
+                > MAX_LAUNCH_AGE_MINUTES
+            ):
+
+                continue
+
+        tx = get_transaction(
+            signature
+        )
+
+        if not tx:
+
+            continue
+
+        mint = extract_pump_mint(
+            tx
+        )
+
+        if not mint:
+
+            continue
+
+        tokens.append({
+            "mint": mint,
+            "signature": signature,
+            "block_time": block_time
+        })
+
+    # The oldest signature is the cursor
+    # boundary for the next scan.
+    #
+    # We save the OLDEST signature we
+    # processed, not the newest.
+
+    oldest_signature = (
+        signatures[-1].get(
+            "signature"
+        )
+    )
+
+    if oldest_signature:
+
+        save_pump_cursor(
+            oldest_signature
+        )
+
+    unique = {}
+
+    for token in tokens:
+
+        unique[
+            token["mint"]
+        ] = token
+
+    return list(
+        unique.values()
+    )
+
+
+# ============================================================
+# DEXSCREENER
+# ============================================================
 
 def get_token_pair(mint):
 
+    response = request_get(
+        DEXSCREENER_TOKEN + mint
+    )
+
+    if not response:
+
+        return None
+
     try:
-
-        response = session.get(
-            DEXSCREENER_TOKEN + mint,
-            timeout=20
-        )
-
-        response.raise_for_status()
 
         data = response.json()
 
-        pairs = data.get("pairs") or []
+        pairs = (
+            data.get("pairs")
+            or []
+        )
 
         solana_pairs = [
             pair
             for pair in pairs
-            if pair.get("chainId") == "solana"
+            if pair.get("chainId")
+            == "solana"
         ]
 
         if not solana_pairs:
+
+            log(
+                f"⏳ No DexScreener pair yet: "
+                f"{mint}"
+            )
+
             return None
 
         solana_pairs.sort(
-            key=lambda p: safe_float(
-                (p.get("liquidity") or {}).get("usd")
+            key=lambda p:
+            safe_float(
+                (
+                    p.get("liquidity")
+                    or {}
+                ).get("usd")
             ),
             reverse=True
         )
@@ -273,14 +1026,154 @@ def get_token_pair(mint):
     except Exception as e:
 
         log(
-            f"Pair lookup error for {mint}: {e}"
+            f"DexScreener JSON error: {e}"
         )
 
         return None
 
 
 # ============================================================
-# SOLANA ON-CHAIN AUTHORITY CHECK
+# RUGCHECK
+# ============================================================
+
+def get_rugcheck_data(mint):
+
+    result = {
+        "holders": None,
+        "top10": None,
+        "risk": None
+    }
+
+    response = request_get(
+        RUGCHECK_REPORT.format(mint)
+    )
+
+    if not response:
+
+        return result
+
+    try:
+
+        data = response.json()
+
+        # HOLDERS
+        holder_count = (
+            data.get("totalHolders")
+            or data.get("holderCount")
+            or data.get("holdersCount")
+        )
+
+        if holder_count is not None:
+
+            result["holders"] = (
+                holder_count
+            )
+
+        # TOP 10
+        top_holders = data.get(
+            "topHolders"
+        )
+
+        if (
+            isinstance(
+                top_holders,
+                list
+            )
+            and top_holders
+        ):
+
+            total_percentage = 0
+
+            for holder in top_holders[:10]:
+
+                if not isinstance(
+                    holder,
+                    dict
+                ):
+                    continue
+
+                percentage = safe_float(
+                    holder.get("pct")
+                    or holder.get(
+                        "percentage"
+                    )
+                    or holder.get(
+                        "ownershipPercentage"
+                    )
+                )
+
+                # Convert 0.25 -> 25%.
+                if (
+                    0 < percentage <= 1
+                ):
+
+                    percentage *= 100
+
+                total_percentage += (
+                    percentage
+                )
+
+            if total_percentage > 0:
+
+                result["top10"] = (
+                    total_percentage
+                )
+
+        # RISK DATA
+        risks = data.get(
+            "risks"
+        )
+
+        if isinstance(
+            risks,
+            list
+        ):
+
+            names = []
+
+            for risk in risks:
+
+                if not isinstance(
+                    risk,
+                    dict
+                ):
+                    continue
+
+                name = (
+                    risk.get("name")
+                    or risk.get(
+                        "description"
+                    )
+                    or risk.get("level")
+                )
+
+                if name:
+
+                    names.append(
+                        str(name)
+                    )
+
+            if names:
+
+                result["risk"] = (
+                    ", ".join(
+                        names[:5]
+                    )
+                )
+
+        return result
+
+    except Exception as e:
+
+        log(
+            f"RugCheck JSON error: {e}"
+        )
+
+        return result
+
+
+# ============================================================
+# TOKEN AUTHORITIES
 # ============================================================
 
 def get_token_authorities(mint):
@@ -291,28 +1184,29 @@ def get_token_authorities(mint):
         "success": False
     }
 
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [
+            mint,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed"
+            }
+        ]
+    }
+
+    response = request_post(
+        SOLANA_RPC,
+        json=payload
+    )
+
+    if not response:
+
+        return result
+
     try:
-
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getAccountInfo",
-            "params": [
-                mint,
-                {
-                    "encoding": "jsonParsed",
-                    "commitment": "confirmed"
-                }
-            ]
-        }
-
-        response = session.post(
-            SOLANA_RPC,
-            json=payload,
-            timeout=20
-        )
-
-        response.raise_for_status()
 
         data = response.json()
 
@@ -323,15 +1217,26 @@ def get_token_authorities(mint):
         )
 
         if not value:
+
             return result
 
-        account_data = value.get("data") or {}
+        account_data = (
+            value.get("data")
+            or {}
+        )
 
-        parsed = account_data.get("parsed") or {}
+        parsed = (
+            account_data.get("parsed")
+            or {}
+        )
 
-        info = parsed.get("info") or {}
+        info = (
+            parsed.get("info")
+            or {}
+        )
 
         if parsed.get("type") != "mint":
+
             return result
 
         result["mint_authority"] = (
@@ -349,159 +1254,27 @@ def get_token_authorities(mint):
     except Exception as e:
 
         log(
-            f"On-chain authority error "
-            f"for {mint}: {e}"
+            f"Authority error: {e}"
         )
 
         return result
 
-
-# ============================================================
-# RUGCHECK
-# ============================================================
-
-def get_rugcheck_data(mint):
-
-    result = {
-        "holders": None,
-        "top10": None,
-        "risk": None
-    }
-
-    try:
-
-        url = RUGCHECK_REPORT.format(mint)
-
-        response = session.get(
-            url,
-            timeout=20
-        )
-
-        if response.status_code != 200:
-            return result
-
-        data = response.json()
-
-        # -----------------------------
-        # HOLDERS
-        # -----------------------------
-
-        holder_count = (
-            data.get("totalHolders")
-            or data.get("holderCount")
-            or data.get("holdersCount")
-        )
-
-        if holder_count is not None:
-            result["holders"] = holder_count
-
-        # -----------------------------
-        # TOP 10
-        # -----------------------------
-
-        top_holders = data.get(
-            "topHolders"
-        )
-
-        if (
-            isinstance(top_holders, list)
-            and top_holders
-        ):
-
-            total_percentage = 0
-
-            for holder in top_holders[:10]:
-
-                if not isinstance(
-                    holder,
-                    dict
-                ):
-                    continue
-
-                percentage = safe_float(
-                    holder.get("pct")
-                    or holder.get("percentage")
-                    or holder.get(
-                        "ownershipPercentage"
-                    )
-                )
-
-                # Some APIs return percentage
-                # as decimal (0.25 = 25%).
-                # Convert decimal format.
-                if 0 < percentage <= 1:
-                    percentage *= 100
-
-                total_percentage += percentage
-
-            if total_percentage > 0:
-                result["top10"] = (
-                    total_percentage
-                )
-
-        # -----------------------------
-        # RISKS
-        # -----------------------------
-
-        risks = data.get("risks")
-
-        if isinstance(risks, list):
-
-            risk_names = []
-
-            for risk in risks:
-
-                if not isinstance(
-                    risk,
-                    dict
-                ):
-                    continue
-
-                name = (
-                    risk.get("name")
-                    or risk.get("description")
-                    or risk.get("level")
-                )
-
-                if name:
-                    risk_names.append(
-                        str(name)
-                    )
-
-            if risk_names:
-
-                result["risk"] = ", ".join(
-                    risk_names[:5]
-                )
-
-        return result
-
-    except Exception as e:
-
-        log(
-            f"RugCheck error for {mint}: {e}"
-        )
-
-        return result
-
-
-# ============================================================
-# AUTHORITY DISPLAY
-# ============================================================
 
 def authority_status(authority):
 
     if authority is None:
+
         return "Revoked"
 
     if authority == "":
+
         return "Revoked"
 
     return "Active"
 
 
 # ============================================================
-# TOKEN AGE
+# AGE
 # ============================================================
 
 def get_age_minutes(pair):
@@ -513,10 +1286,11 @@ def get_age_minutes(pair):
         )
 
         if not created:
+
             return None
 
         created_seconds = (
-            safe_float(created) / 1000
+            float(created) / 1000
         )
 
         now = datetime.now(
@@ -528,315 +1302,390 @@ def get_age_minutes(pair):
             now - created_seconds
         )
 
-        return age_seconds / 60
+        return int(
+            age_seconds / 60
+        )
 
     except Exception:
 
         return None
 
 
-def format_age(pair):
+def format_age(age_minutes):
 
-    minutes = get_age_minutes(pair)
+    if age_minutes is None:
 
-    if minutes is None:
         return "Unknown"
 
-    minutes_int = int(minutes)
+    if age_minutes < 60:
 
-    if minutes_int < 60:
-        return f"{minutes_int} min"
+        return (
+            f"{age_minutes} min"
+        )
 
-    hours = int(minutes_int / 60)
+    hours = age_minutes // 60
 
     if hours < 24:
-        return f"{hours} hr"
 
-    days = int(hours / 24)
+        return (
+            f"{hours} hr"
+        )
 
-    return f"{days} day"
+    days = hours // 24
+
+    return (
+        f"{days} day"
+    )
 
 
 # ============================================================
-# RISK HELPERS
+# RISK FLAGS
 # ============================================================
-
-def risk_emoji(level):
-
-    if level == "LOW":
-        return "🟢"
-
-    if level == "MEDIUM":
-        return "🟡"
-
-    if level == "HIGH":
-        return "🔴"
-
-    return "⚪"
-
-
-# ------------------------------------------------------------
-# TOP 10 RISK
-# ------------------------------------------------------------
 
 def evaluate_top10(top10):
 
     if top10 is None:
-        return {
-            "level": "UNKNOWN",
-            "text": "Unknown"
-        }
+
+        return "⚪ Top 10: Unknown"
 
     if top10 <= TOP10_GREEN:
-        return {
-            "level": "LOW",
-            "text": f"{top10:.1f}%"
-        }
+
+        return (
+            f"🟢 Top 10: "
+            f"{top10:.1f}%"
+        )
 
     if top10 <= TOP10_YELLOW:
-        return {
-            "level": "MEDIUM",
-            "text": f"{top10:.1f}%"
-        }
 
-    return {
-        "level": "HIGH",
-        "text": f"{top10:.1f}%"
-    }
+        return (
+            f"🟡 Top 10: "
+            f"{top10:.1f}%"
+        )
+
+    return (
+        f"🔴 Top 10: "
+        f"{top10:.1f}%"
+    )
 
 
-# ------------------------------------------------------------
-# LIQUIDITY / MC
-# ------------------------------------------------------------
-
-def evaluate_liquidity_mc(liquidity, mc):
+def evaluate_liquidity_mc(
+    liquidity,
+    mc
+):
 
     if mc <= 0:
-        return {
-            "level": "UNKNOWN",
-            "text": "Unknown"
-        }
+
+        return (
+            "⚪ Liquidity/MC: Unknown"
+        )
 
     ratio = (
         liquidity / mc
     ) * 100
 
     if ratio >= LIQ_MC_GREEN:
-        level = "LOW"
+
+        emoji = "🟢"
 
     elif ratio >= LIQ_MC_YELLOW:
-        level = "MEDIUM"
+
+        emoji = "🟡"
 
     else:
-        level = "HIGH"
 
-    return {
-        "level": level,
-        "text": f"{ratio:.1f}%"
-    }
+        emoji = "🔴"
+
+    return (
+        f"{emoji} Liquidity/MC: "
+        f"{ratio:.1f}%"
+    )
 
 
-# ------------------------------------------------------------
-# VOLUME / MC
-# ------------------------------------------------------------
-
-def evaluate_volume_mc(volume, mc):
+def evaluate_volume_mc(
+    volume,
+    mc
+):
 
     if mc <= 0:
-        return {
-            "level": "UNKNOWN",
-            "text": "Unknown"
-        }
 
-    ratio = volume / mc
+        return (
+            "⚪ Volume/MC: Unknown"
+        )
+
+    ratio = (
+        volume / mc
+    )
 
     if ratio <= VOL_MC_GREEN_MAX:
-        level = "LOW"
+
+        emoji = "🟢"
 
     elif ratio <= VOL_MC_YELLOW_MAX:
-        level = "MEDIUM"
+
+        emoji = "🟡"
 
     else:
-        level = "HIGH"
 
-    return {
-        "level": level,
-        "text": f"{ratio:.1f}x"
-    }
+        emoji = "🔴"
 
+    return (
+        f"{emoji} Volume/MC: "
+        f"{ratio:.1f}x"
+    )
 
-# ------------------------------------------------------------
-# HOLDERS
-# ------------------------------------------------------------
 
 def evaluate_holders(holders):
 
     if holders is None:
-        return {
-            "level": "UNKNOWN",
-            "text": "Unknown"
-        }
 
-    holders_value = safe_float(
-        holders
+        return (
+            "⚪ Holders: Unknown"
+        )
+
+    holders = int(
+        safe_float(holders)
     )
 
-    if holders_value >= HOLDERS_GREEN:
-        level = "LOW"
+    if holders >= HOLDERS_GREEN:
 
-    elif holders_value >= HOLDERS_YELLOW:
-        level = "MEDIUM"
+        emoji = "🟢"
+
+    elif holders >= HOLDERS_YELLOW:
+
+        emoji = "🟡"
 
     else:
-        level = "HIGH"
 
-    return {
-        "level": level,
-        "text": format_number(holders_value)
-    }
+        emoji = "🔴"
 
+    return (
+        f"{emoji} Holders: "
+        f"{holders:,}"
+    )
 
-# ------------------------------------------------------------
-# AGE
-# ------------------------------------------------------------
 
 def evaluate_age(age_minutes):
 
     if age_minutes is None:
-        return {
-            "level": "UNKNOWN",
-            "text": "Unknown"
-        }
+
+        return (
+            "⚪ Age: Unknown"
+        )
 
     if age_minutes >= AGE_GREEN:
-        level = "LOW"
+
+        emoji = "🟢"
 
     elif age_minutes >= AGE_YELLOW:
-        level = "MEDIUM"
+
+        emoji = "🟡"
 
     else:
-        level = "HIGH"
 
-    if age_minutes < 60:
-        text = f"{int(age_minutes)} min"
+        emoji = "🔴"
 
-    else:
-        text = f"{int(age_minutes / 60)} hr"
-
-    return {
-        "level": level,
-        "text": text
-    }
+    return (
+        f"{emoji} Age: "
+        f"{format_age(age_minutes)}"
+    )
 
 
-# ============================================================
-# OVERALL RISK
-# ============================================================
+def calculate_overall_risk(
+    levels
+):
 
-def calculate_overall_risk(flags):
+    high = levels.count(
+        "HIGH"
+    )
 
-    levels = []
+    medium = levels.count(
+        "MEDIUM"
+    )
 
-    for flag in flags:
+    if high >= 2:
 
-        level = flag.get("level")
-
-        if level in (
-            "LOW",
-            "MEDIUM",
-            "HIGH"
-        ):
-            levels.append(level)
-
-    if not levels:
-        return "UNKNOWN"
-
-    high_count = levels.count("HIGH")
-    medium_count = levels.count("MEDIUM")
-
-    # Any two or more major warning signals
-    # produces HIGH overall risk.
-    if high_count >= 2:
         return "HIGH"
 
-    if high_count == 1 and medium_count >= 1:
+    if high >= 1 and medium >= 1:
+
         return "HIGH"
 
-    if high_count == 1:
+    if high == 1:
+
         return "MEDIUM"
 
-    if medium_count >= 2:
+    if medium >= 2:
+
         return "MEDIUM"
 
-    if medium_count == 1:
+    if medium == 1:
+
         return "MEDIUM"
 
     return "LOW"
 
 
-# ============================================================
-# BUILD RISK FLAGS
-# ============================================================
-
 def build_risk_flags(
-    mc,
+    top10,
     liquidity,
+    mc,
     volume,
     holders,
-    top10,
     age_minutes
 ):
 
-    top10_result = evaluate_top10(
-        top10
-    )
+    levels = []
 
-    liquidity_result = evaluate_liquidity_mc(
-        liquidity,
-        mc
-    )
+    # TOP 10
+    if top10 is None:
 
-    volume_result = evaluate_volume_mc(
-        volume,
-        mc
-    )
+        top10_level = "UNKNOWN"
 
-    holders_result = evaluate_holders(
-        holders
-    )
+    elif top10 <= TOP10_GREEN:
 
-    age_result = evaluate_age(
-        age_minutes
-    )
+        top10_level = "LOW"
 
-    flags = [
-        {
-            "name": "Top 10 concentration",
-            **top10_result
-        },
-        {
-            "name": "Liquidity/MC",
-            **liquidity_result
-        },
-        {
-            "name": "Volume/MC",
-            **volume_result
-        },
-        {
-            "name": "Holders",
-            **holders_result
-        },
-        {
-            "name": "Age",
-            **age_result
-        }
-    ]
+    elif top10 <= TOP10_YELLOW:
+
+        top10_level = "MEDIUM"
+
+    else:
+
+        top10_level = "HIGH"
+
+    if top10_level != "UNKNOWN":
+
+        levels.append(
+            top10_level
+        )
+
+    # LIQUIDITY / MC
+    if mc <= 0:
+
+        liq_level = "UNKNOWN"
+
+    else:
+
+        ratio = (
+            liquidity / mc
+        ) * 100
+
+        if ratio >= LIQ_MC_GREEN:
+
+            liq_level = "LOW"
+
+        elif ratio >= LIQ_MC_YELLOW:
+
+            liq_level = "MEDIUM"
+
+        else:
+
+            liq_level = "HIGH"
+
+    if liq_level != "UNKNOWN":
+
+        levels.append(
+            liq_level
+        )
+
+    # VOLUME / MC
+    if mc <= 0:
+
+        vol_level = "UNKNOWN"
+
+    else:
+
+        ratio = (
+            volume / mc
+        )
+
+        if ratio <= VOL_MC_GREEN_MAX:
+
+            vol_level = "LOW"
+
+        elif ratio <= VOL_MC_YELLOW_MAX:
+
+            vol_level = "MEDIUM"
+
+        else:
+
+            vol_level = "HIGH"
+
+    if vol_level != "UNKNOWN":
+
+        levels.append(
+            vol_level
+        )
+
+    # HOLDERS
+    if holders is None:
+
+        holder_level = "UNKNOWN"
+
+    elif holders >= HOLDERS_GREEN:
+
+        holder_level = "LOW"
+
+    elif holders >= HOLDERS_YELLOW:
+
+        holder_level = "MEDIUM"
+
+    else:
+
+        holder_level = "HIGH"
+
+    if holder_level != "UNKNOWN":
+
+        levels.append(
+            holder_level
+        )
+
+    # AGE
+    if age_minutes is None:
+
+        age_level = "UNKNOWN"
+
+    elif age_minutes >= AGE_GREEN:
+
+        age_level = "LOW"
+
+    elif age_minutes >= AGE_YELLOW:
+
+        age_level = "MEDIUM"
+
+    else:
+
+        age_level = "HIGH"
+
+    if age_level != "UNKNOWN":
+
+        levels.append(
+            age_level
+        )
 
     overall = calculate_overall_risk(
-        flags
+        levels
     )
 
-    return flags, overall
+    text = "\n".join([
+        evaluate_top10(top10),
+        evaluate_liquidity_mc(
+            liquidity,
+            mc
+        ),
+        evaluate_volume_mc(
+            volume,
+            mc
+        ),
+        evaluate_holders(
+            holders
+        ),
+        evaluate_age(
+            age_minutes
+        )
+    ])
+
+    return text, overall
 
 
 # ============================================================
@@ -848,8 +1697,7 @@ def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN:
 
         log(
-            "ERROR: TELEGRAM_BOT_TOKEN "
-            "is missing"
+            "ERROR: TELEGRAM_BOT_TOKEN missing"
         )
 
         return False
@@ -857,8 +1705,7 @@ def send_telegram(message):
     if not TELEGRAM_CHAT_ID:
 
         log(
-            "ERROR: TELEGRAM_CHAT_ID "
-            "is missing"
+            "ERROR: TELEGRAM_CHAT_ID missing"
         )
 
         return False
@@ -873,32 +1720,33 @@ def send_telegram(message):
         "disable_web_page_preview": False
     }
 
+    response = request_post(
+        url,
+        json=payload
+    )
+
+    if not response:
+
+        return False
+
     try:
 
-        response = session.post(
-            url,
-            json=payload,
-            timeout=20
-        )
+        data = response.json()
 
-        if response.status_code == 200:
+        if data.get("ok"):
+
             return True
 
         log(
-            f"Telegram error: "
-            f"{response.status_code} "
-            f"{response.text[:300]}"
+            f"Telegram API error: "
+            f"{data}"
         )
 
-        return False
+    except Exception:
 
-    except Exception as e:
+        pass
 
-        log(
-            f"Telegram connection error: {e}"
-        )
-
-        return False
+    return False
 
 
 # ============================================================
@@ -913,7 +1761,8 @@ def build_alert(
 ):
 
     base_token = (
-        pair.get("baseToken") or {}
+        pair.get("baseToken")
+        or {}
     )
 
     name = (
@@ -932,52 +1781,50 @@ def build_alert(
     )
 
     liquidity = safe_float(
-        (pair.get("liquidity") or {})
-        .get("usd")
+        (
+            pair.get("liquidity")
+            or {}
+        ).get("usd")
     )
 
     volume = safe_float(
-        (pair.get("volume") or {})
-        .get("h24")
+        (
+            pair.get("volume")
+            or {}
+        ).get("h24")
     )
-
-    # -----------------------------
-    # HOLDERS
-    # -----------------------------
 
     holders = security.get(
         "holders"
     )
 
     if holders is None:
+
         holders_text = "Unknown"
 
     else:
+
         holders_text = format_number(
             holders
         )
-
-    # -----------------------------
-    # TOP 10
-    # -----------------------------
 
     top10 = security.get(
         "top10"
     )
 
     if top10 is None:
+
         top10_text = "Unknown"
 
     else:
+
         top10_text = (
             f"{top10:.1f}%"
         )
 
-    # -----------------------------
-    # AUTHORITIES
-    # -----------------------------
-
-    if authorities.get("success"):
+    if authorities.get(
+        "success"
+    ):
 
         mint_status = authority_status(
             authorities.get(
@@ -996,78 +1843,52 @@ def build_alert(
         mint_status = "Unknown"
         freeze_status = "Unknown"
 
-    # -----------------------------
-    # AGE
-    # -----------------------------
-
     age_minutes = get_age_minutes(
         pair
     )
 
-    age = format_age(pair)
-
-    # -----------------------------
-    # RISK FLAGS
-    # -----------------------------
-
-    flags, overall = build_risk_flags(
-        mc,
-        liquidity,
-        volume,
-        holders,
-        top10,
+    age = format_age(
         age_minutes
     )
 
-    # -----------------------------
-    # RISK MESSAGE
-    # -----------------------------
-
-    risk_lines = []
-
-    for flag in flags:
-
-        emoji = risk_emoji(
-            flag["level"]
+    risk_text, overall = (
+        build_risk_flags(
+            top10,
+            liquidity,
+            mc,
+            volume,
+            holders,
+            age_minutes
         )
-
-        risk_lines.append(
-            f"{emoji} "
-            f"{flag['name']}: "
-            f"{flag['level']} — "
-            f"{flag['text']}"
-        )
-
-    risk_text = "\n".join(
-        risk_lines
     )
 
-    overall_emoji = risk_emoji(
-        overall
-    )
+    if overall == "LOW":
 
-    # -----------------------------
-    # LINKS
-    # -----------------------------
+        overall_emoji = "🟢"
+
+    elif overall == "MEDIUM":
+
+        overall_emoji = "🟡"
+
+    else:
+
+        overall_emoji = "🔴"
 
     dex_url = (
         pair.get("url")
-        or (
-            "https://dexscreener.com/"
-            f"solana/{mint}"
-        )
+        or
+        f"https://dexscreener.com/solana/{mint}"
     )
 
     rug_url = (
-        f"https://rugcheck.xyz/tokens/"
-        f"{mint}"
+        f"https://rugcheck.xyz/tokens/{mint}"
     )
 
-    # -----------------------------
-    # MESSAGE
-    # -----------------------------
+    pump_url = (
+        f"https://pump.fun/coin/{mint}"
+    )
 
-    message = f"""🚨 NEW SOLANA TOKEN
+    message = f"""🚨 NEW PUMP.FUN TOKEN
 
 Name: {name} ({symbol})
 
@@ -1090,6 +1911,9 @@ CA:
 
 {overall_emoji} OVERALL RISK: {overall}
 
+🔗 Pump.fun:
+{pump_url}
+
 🔗 DexScreener:
 {dex_url}
 
@@ -1103,6 +1927,152 @@ CA:
 
 
 # ============================================================
+# PROCESS TOKEN
+# ============================================================
+
+def process_token(
+    mint,
+    seen
+):
+
+    if mint in seen:
+
+        return False
+
+    # Give DexScreener time to index
+    # a brand-new Pump.fun token.
+
+    pair = None
+
+    for attempt in range(
+        1,
+        4
+    ):
+
+        pair = get_token_pair(
+            mint
+        )
+
+        if pair:
+
+            break
+
+        log(
+            f"Waiting for DexScreener "
+            f"indexing "
+            f"({attempt}/3): "
+            f"{mint}"
+        )
+
+        time.sleep(5)
+
+    if not pair:
+
+        log(
+            f"Skipped — no DexScreener "
+            f"pair yet: {mint}"
+        )
+
+        return False
+
+    mc = safe_float(
+        pair.get("marketCap")
+        or pair.get("fdv")
+    )
+
+    liquidity = safe_float(
+        (
+            pair.get("liquidity")
+            or {}
+        ).get("usd")
+    )
+
+    # MARKET CAP
+    if mc < MIN_MC:
+
+        log(
+            f"Filtered MC below "
+            f"${MIN_MC:,}: "
+            f"{mint} | "
+            f"{format_money(mc)}"
+        )
+
+        return False
+
+    if mc > MAX_MC:
+
+        log(
+            f"Filtered MC above "
+            f"${MAX_MC:,}: "
+            f"{mint} | "
+            f"{format_money(mc)}"
+        )
+
+        return False
+
+    # LIQUIDITY
+    if liquidity < MIN_LIQUIDITY:
+
+        log(
+            f"Filtered liquidity: "
+            f"{mint} | "
+            f"{format_money(liquidity)}"
+        )
+
+        return False
+
+    log(
+        f"🔥 QUALIFIED PUMP.FUN TOKEN: "
+        f"{mint} | "
+        f"MC={format_money(mc)} | "
+        f"Liquidity="
+        f"{format_money(liquidity)}"
+    )
+
+    # SECURITY
+    security = get_rugcheck_data(
+        mint
+    )
+
+    authorities = (
+        get_token_authorities(
+            mint
+        )
+    )
+
+    message = build_alert(
+        pair,
+        mint,
+        security,
+        authorities
+    )
+
+    # TELEGRAM
+    if send_telegram(message):
+
+        log(
+            f"✅ Telegram alert sent: "
+            f"{mint}"
+        )
+
+        # Only mark as seen after
+        # successful Telegram delivery.
+
+        seen.add(mint)
+
+        save_seen(seen)
+
+        return True
+
+    log(
+        f"❌ Telegram failed: "
+        f"{mint}"
+    )
+
+    return False
+
+
+# ============================================================
 # SCAN
 # ============================================================
 
@@ -1110,147 +2080,90 @@ def scan():
 
     seen = load_seen()
 
-    log("=" * 60)
+    log("=" * 70)
 
     log(
-        "🚀 SOLANA SCANNER STARTED"
+        "🚀 PUMP.FUN DIRECT SCANNER"
     )
 
     log(
-        f"Filters: MC "
+        "Detection: ON-CHAIN "
+        "CREATE + CREATE_V2"
+    )
+
+    log(
+        f"Market Cap: "
         f"${MIN_MC:,} - "
-        f"${MAX_MC:,} | "
-        f"Liquidity >= "
+        f"${MAX_MC:,}"
+    )
+
+    log(
+        f"Minimum Liquidity: "
         f"${MIN_LIQUIDITY:,}"
     )
 
     log(
-        f"Previously alerted tokens: "
+        f"Previously alerted: "
         f"{len(seen)}"
     )
 
-    addresses = (
-        get_latest_solana_tokens()
+    tokens = (
+        discover_new_pump_tokens()
     )
 
     log(
-        f"Discovered "
-        f"{len(addresses)} "
-        f"Solana token addresses"
+        f"New Pump.fun launches detected: "
+        f"{len(tokens)}"
     )
 
     checked = 0
     alerts = 0
 
-    for mint in addresses:
+    for token in tokens:
 
-        if mint in seen:
+        mint = token.get(
+            "mint"
+        )
+
+        if not mint:
+
             continue
 
         checked += 1
 
-        pair = get_token_pair(mint)
+        try:
 
-        if not pair:
-            continue
+            if process_token(
+                mint,
+                seen
+            ):
 
-        mc = safe_float(
-            pair.get("marketCap")
-            or pair.get("fdv")
-        )
+                alerts += 1
 
-        liquidity = safe_float(
-            (pair.get("liquidity") or {})
-            .get("usd")
-        )
-
-        # -----------------------------
-        # MARKET CAP FILTER
-        # -----------------------------
-
-        if mc < MIN_MC:
-            continue
-
-        if mc > MAX_MC:
-            continue
-
-        # -----------------------------
-        # LIQUIDITY FILTER
-        # -----------------------------
-
-        if liquidity < MIN_LIQUIDITY:
-            continue
-
-        log(
-            f"QUALIFIED: {mint} | "
-            f"MC={format_money(mc)} | "
-            f"Liquidity="
-            f"{format_money(liquidity)}"
-        )
-
-        # -----------------------------
-        # SECURITY DATA
-        # -----------------------------
-
-        security = get_rugcheck_data(
-            mint
-        )
-
-        # -----------------------------
-        # DIRECT BLOCKCHAIN CHECK
-        # -----------------------------
-
-        authorities = (
-            get_token_authorities(mint)
-        )
-
-        # -----------------------------
-        # BUILD ALERT
-        # -----------------------------
-
-        message = build_alert(
-            pair,
-            mint,
-            security,
-            authorities
-        )
-
-        if send_telegram(message):
+        except Exception as e:
 
             log(
-                f"Telegram alert sent: "
-                f"{mint}"
-            )
-
-            seen.add(mint)
-
-            alerts += 1
-
-            save_seen(seen)
-
-        else:
-
-            log(
-                f"Telegram failed: "
-                f"{mint}"
+                f"Processing error "
+                f"for {mint}: {e}"
             )
 
     save_seen(seen)
 
-    log("=" * 60)
+    log("=" * 70)
 
     log(
         f"SCAN COMPLETE | "
-        f"Checked: {checked} | "
+        f"Pump launches checked: "
+        f"{checked} | "
         f"New alerts: {alerts} | "
         f"Seen: {len(seen)}"
     )
 
-    log("=" * 60)
+    log("=" * 70)
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
@@ -1278,11 +2191,16 @@ def main():
     )
 
     log(
-        "Automatic scanner is ready."
+        "✅ Direct Pump.fun scanner ready."
     )
 
     log(
-        f"Scanner will run every "
+        "Works with GitHub Actions "
+        "and Termux."
+    )
+
+    log(
+        f"Scanning every "
         f"{SCAN_INTERVAL // 60} minutes."
     )
 
@@ -1295,8 +2213,8 @@ def main():
         except Exception as e:
 
             log(
-                f"Unexpected scanner "
-                f"error: {e}"
+                f"Unexpected scanner error: "
+                f"{e}"
             )
 
         log(
@@ -1309,5 +2227,10 @@ def main():
         )
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
